@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # SETTINGS
 # ============================================================
 
-OKX_BASE = "https://www.okx.com"
+BLOFIN_BASE = "https://openapi.blofin.com"
 
 DISCORD_WEBHOOK = os.environ.get(
     "DISCORD_WEBHOOK_URL"
@@ -22,18 +22,19 @@ VOLUME_LOOKBACK = 20
 
 VOLUME_MULTIPLIER = 2.0
 
-# Number of simultaneous workers
 MAX_WORKERS = 15
 
-# Stay safely below OKX public candle API limit
-# OKX candle endpoint: 40 requests / 2 seconds
-REQUESTS_PER_2S = 35
+# BloFin REST limit is 500 requests/minute.
+# Stay safely below it.
+MAX_REQUESTS_PER_MINUTE = 450
 
-REQUEST_INTERVAL = 2.0 / REQUESTS_PER_2S
+REQUEST_INTERVAL = (
+    60.0 / MAX_REQUESTS_PER_MINUTE
+)
 
 
 # ============================================================
-# RATE LIMITER
+# GLOBAL RATE LIMITER
 # ============================================================
 
 _last_request_time = 0.0
@@ -41,8 +42,30 @@ _last_request_time = 0.0
 _rate_lock = threading.Lock()
 
 
+def throttle():
+
+    global _last_request_time
+
+    with _rate_lock:
+
+        now = time.monotonic()
+
+        wait = (
+            REQUEST_INTERVAL
+            - (now - _last_request_time)
+        )
+
+        if wait > 0:
+
+            time.sleep(wait)
+
+        _last_request_time = (
+            time.monotonic()
+        )
+
+
 # ============================================================
-# THREAD LOCAL HTTP SESSIONS
+# THREAD LOCAL SESSION
 # ============================================================
 
 _thread_local = threading.local()
@@ -59,7 +82,7 @@ def get_session():
 
         session.headers.update({
             "User-Agent":
-                "Crypto-Discord-Scanner/3.0"
+                "Crypto-Discord-Scanner/4.0"
         })
 
         _thread_local.session = session
@@ -68,32 +91,7 @@ def get_session():
 
 
 # ============================================================
-# OKX REQUEST THROTTLE
-# ============================================================
-
-def throttle():
-
-    global _last_request_time
-
-    with _rate_lock:
-
-        now = time.monotonic()
-
-        wait = (
-            REQUEST_INTERVAL
-            - (now - _last_request_time)
-        )
-
-        if wait > 0:
-            time.sleep(wait)
-
-        _last_request_time = (
-            time.monotonic()
-        )
-
-
-# ============================================================
-# OKX API REQUEST
+# BLOFIN API REQUEST
 # ============================================================
 
 def get_json(
@@ -103,7 +101,7 @@ def get_json(
 ):
 
     url = (
-        f"{OKX_BASE}{path}"
+        f"{BLOFIN_BASE}{path}"
     )
 
     for attempt in range(retries):
@@ -118,36 +116,26 @@ def get_json(
                 timeout=15
             )
 
-            # OKX HTTP rate limit
+            # BloFin firewall / rate limit
             if response.status_code == 429:
 
-                retry_after = (
-                    response.headers.get(
-                        "Retry-After"
-                    )
+                print(
+                    "BloFin rate limit. "
+                    "Waiting 10 seconds..."
                 )
 
-                if retry_after:
+                time.sleep(10)
 
-                    wait = float(
-                        retry_after
-                    )
+                continue
 
-                else:
-
-                    wait = 2.0
+            if response.status_code == 403:
 
                 print(
-                    f"OKX rate limit. "
-                    f"Waiting {wait:.1f}s..."
+                    "BloFin HTTP 403. "
+                    "Waiting 15 seconds..."
                 )
 
-                time.sleep(
-                    min(
-                        wait + 0.5,
-                        10
-                    )
-                )
+                time.sleep(15)
 
                 continue
 
@@ -155,72 +143,71 @@ def get_json(
 
             data = response.json()
 
-            if data.get("code") != "0":
+            if str(data.get("code")) != "0":
 
                 raise RuntimeError(
-                    f"OKX API error "
+                    f"BloFin API error "
                     f"{data.get('code')}: "
                     f"{data.get('msg')}"
                 )
 
             return data
 
-        except Exception:
+        except Exception as e:
 
-            if (
-                attempt
-                == retries - 1
-            ):
+            if attempt == retries - 1:
 
                 raise
 
+            print(
+                f"Request error: {e}. "
+                f"Retrying..."
+            )
+
             time.sleep(
-                1.0 * (attempt + 1)
+                2 * (attempt + 1)
             )
 
     return None
 
 
 # ============================================================
-# GET ALL OKX USDT PERPETUALS
+# GET LIVE USDT PERPETUALS
 # ============================================================
 
 def get_symbols():
 
     data = get_json(
-        "/api/v5/public/instruments",
-        {
-            "instType": "SWAP"
-        }
+        "/api/v1/market/instruments"
     )
 
     symbols = []
 
     for item in data["data"]:
 
-        inst_id = item.get(
-            "instId",
-            ""
-        )
-
         if (
             item.get("state")
             == "live"
 
-            and item.get("settleCcy")
-            == "USDT"
+            and item.get("instType")
+            == "SWAP"
 
-            and item.get("ctType")
+            and item.get("contractType")
             == "linear"
 
-            and inst_id.endswith(
-                "-USDT-SWAP"
-            )
+            and item.get("settleCurrency")
+            == "USDT"
         ):
 
-            symbols.append(
-                inst_id
+            inst_id = item.get(
+                "instId"
             )
+
+            if inst_id:
+
+                symbols.append(
+                    inst_id
+                )
 
     return sorted(
         set(symbols)
@@ -228,27 +215,27 @@ def get_symbols():
 
 
 # ============================================================
-# GET OKX CANDLES
+# GET CANDLES
 # ============================================================
 
 def get_candles(
-    inst_id,
-    bar,
+    symbol,
+    timeframe,
     limit
 ):
 
     data = get_json(
-        "/api/v5/market/candles",
+        "/api/v1/market/candles",
         {
-            "instId": inst_id,
-            "bar": bar,
+            "instId": symbol,
+            "bar": timeframe,
             "limit": str(limit)
         }
     )
 
     candles = data["data"]
 
-    # OKX returns newest first.
+    # BloFin returns newest first.
     # Convert to oldest -> newest.
     return list(
         reversed(candles)
@@ -269,7 +256,7 @@ def calculate_ema(
         return None
 
     multiplier = (
-        2 / (period + 1)
+        2.0 / (period + 1)
     )
 
     ema = (
@@ -320,21 +307,13 @@ def calculate_daily_vwap(
 
             continue
 
-        high = float(
-            candle[2]
-        )
+        high = float(candle[2])
 
-        low = float(
-            candle[3]
-        )
+        low = float(candle[3])
 
-        close = float(
-            candle[4]
-        )
+        close = float(candle[4])
 
-        volume = float(
-            candle[5]
-        )
+        volume = float(candle[5])
 
         typical_price = (
             high
@@ -351,10 +330,7 @@ def calculate_daily_vwap(
             volume
         )
 
-    if (
-        cumulative_volume
-        <= 0
-    ):
+    if cumulative_volume <= 0:
 
         return None
 
@@ -365,7 +341,7 @@ def calculate_daily_vwap(
 
 
 # ============================================================
-# CHECK ONE COIN
+# CHECK ONE SYMBOL
 # ============================================================
 
 def check_symbol(symbol):
@@ -386,8 +362,12 @@ def check_symbol(symbol):
 
             return None
 
-        # Ignore currently forming candle
+        # Ignore current incomplete candle
         completed = candles[:-1]
+
+        if len(completed) < 22:
+
+            return None
 
         current = completed[-1]
 
@@ -406,19 +386,21 @@ def check_symbol(symbol):
         )
 
         # ----------------------------------------------------
-        # VOLUME > 2X
+        # VOLUME SURGE
         # ----------------------------------------------------
 
         previous_volumes = [
+
             float(candle[5])
+
             for candle
             in completed[-21:-1]
+
         ]
 
-        if (
-            len(previous_volumes)
-            != VOLUME_LOOKBACK
-        ):
+        if len(
+            previous_volumes
+        ) != VOLUME_LOOKBACK:
 
             return None
 
@@ -486,7 +468,7 @@ def check_symbol(symbol):
         )
 
         # ----------------------------------------------------
-        # 1H EMA 200
+        # ONLY NOW REQUEST 1H DATA
         # ----------------------------------------------------
 
         candles_1h = get_candles(
@@ -504,9 +486,12 @@ def check_symbol(symbol):
         )
 
         closes_1h = [
+
             float(candle[4])
+
             for candle
             in completed_1h
+
         ]
 
         ema200 = calculate_ema(
@@ -548,11 +533,8 @@ def check_symbol(symbol):
         )
 
         # ----------------------------------------------------
-        # ALL 3 CONDITIONS
+        # FINAL SIGNAL
         # ----------------------------------------------------
-
-        # Alert only when price newly crosses
-        # VWAP or 1H EMA 200.
 
         if not (
             crossed_vwap
@@ -596,7 +578,7 @@ def check_symbol(symbol):
 
 
 # ============================================================
-# SPLIT DISCORD MESSAGE
+# DISCORD MESSAGE SPLITTER
 # ============================================================
 
 def split_message(
@@ -661,7 +643,7 @@ def send_discord_alert(
 
     lines = [
 
-        "🚨 **CRYPTO ALERTS** 🚨",
+        "🚨 **BLOFIN CRYPTO ALERTS** 🚨",
 
         f"**{len(results)} coins "
         f"meet ALL 3 conditions**",
@@ -696,7 +678,7 @@ def send_discord_alert(
             f"💰 Price: "
             f"`{result['price']:.8g}`",
 
-            f"📊 VWAP: "
+            f"📊 Daily VWAP: "
             f"`{result['vwap']:.8g}`",
 
             f"📈 1H EMA 200: "
@@ -769,7 +751,6 @@ def send_discord_alert(
                 retry_after + 1
             )
 
-        # Small pause between Discord messages
         time.sleep(0.75)
 
 
@@ -784,7 +765,7 @@ def main():
     print("=" * 60)
 
     print(
-        "OKX VWAP + EMA200 + "
+        "BLOFIN VWAP + EMA200 + "
         "VOLUME SCANNER"
     )
 
@@ -798,7 +779,7 @@ def main():
         )
 
     print(
-        "Getting OKX USDT "
+        "Getting BloFin USDT "
         "perpetual symbols..."
     )
 
@@ -861,7 +842,7 @@ def main():
             completed_count += 1
 
             if (
-                completed_count % 100
+                completed_count % 50
                 == 0
             ):
 
@@ -872,7 +853,7 @@ def main():
                 )
 
     # --------------------------------------------------------
-    # SORT RESULTS
+    # SORT
     # --------------------------------------------------------
 
     results.sort(
@@ -888,7 +869,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # SEND DISCORD
+    # DISCORD
     # --------------------------------------------------------
 
     if results:
@@ -932,7 +913,7 @@ def main():
 
 
 # ============================================================
-# START
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
