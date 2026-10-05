@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import requests
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,164 +10,267 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # SETTINGS
 # ============================================================
 
-BYBIT_BASE = "https://api.bybit.com"
-
-TIMEFRAME_15M = "15"
-TIMEFRAME_1H = "60"
-
-EMA_PERIOD = 200
-VOLUME_LOOKBACK = 20
-VOLUME_MULTIPLIER = 2.0
-
-# Number of simultaneous market-data requests.
-# 15 is deliberately conservative.
-MAX_WORKERS = 15
+OKX_BASE = "https://www.okx.com"
 
 DISCORD_WEBHOOK = os.environ.get(
     "DISCORD_WEBHOOK_URL"
 )
 
+EMA_PERIOD = 200
+
+VOLUME_LOOKBACK = 20
+
+VOLUME_MULTIPLIER = 2.0
+
+# Number of simultaneous workers
+MAX_WORKERS = 15
+
+# Stay safely below OKX public candle API limit
+# OKX candle endpoint: 40 requests / 2 seconds
+REQUESTS_PER_2S = 35
+
+REQUEST_INTERVAL = 2.0 / REQUESTS_PER_2S
+
 
 # ============================================================
-# HTTP SESSION
+# RATE LIMITER
 # ============================================================
 
-session = requests.Session()
+_last_request_time = 0.0
 
-session.headers.update({
-    "User-Agent": "Crypto-Discord-Scanner/2.0"
-})
+_rate_lock = threading.Lock()
 
 
 # ============================================================
-# BYBIT REQUEST
+# THREAD LOCAL HTTP SESSIONS
 # ============================================================
 
-def get_json(endpoint, params=None, retries=4):
+_thread_local = threading.local()
 
-    url = f"{BYBIT_BASE}{endpoint}"
+
+def get_session():
+
+    if not hasattr(
+        _thread_local,
+        "session"
+    ):
+
+        session = requests.Session()
+
+        session.headers.update({
+            "User-Agent":
+                "Crypto-Discord-Scanner/3.0"
+        })
+
+        _thread_local.session = session
+
+    return _thread_local.session
+
+
+# ============================================================
+# OKX REQUEST THROTTLE
+# ============================================================
+
+def throttle():
+
+    global _last_request_time
+
+    with _rate_lock:
+
+        now = time.monotonic()
+
+        wait = (
+            REQUEST_INTERVAL
+            - (now - _last_request_time)
+        )
+
+        if wait > 0:
+            time.sleep(wait)
+
+        _last_request_time = (
+            time.monotonic()
+        )
+
+
+# ============================================================
+# OKX API REQUEST
+# ============================================================
+
+def get_json(
+    path,
+    params=None,
+    retries=4
+):
+
+    url = (
+        f"{OKX_BASE}{path}"
+    )
 
     for attempt in range(retries):
 
         try:
 
-            response = session.get(
+            throttle()
+
+            response = get_session().get(
                 url,
                 params=params,
                 timeout=15
             )
 
+            # OKX HTTP rate limit
+            if response.status_code == 429:
+
+                retry_after = (
+                    response.headers.get(
+                        "Retry-After"
+                    )
+                )
+
+                if retry_after:
+
+                    wait = float(
+                        retry_after
+                    )
+
+                else:
+
+                    wait = 2.0
+
+                print(
+                    f"OKX rate limit. "
+                    f"Waiting {wait:.1f}s..."
+                )
+
+                time.sleep(
+                    min(
+                        wait + 0.5,
+                        10
+                    )
+                )
+
+                continue
+
             response.raise_for_status()
 
             data = response.json()
 
-            if data.get("retCode") != 0:
+            if data.get("code") != "0":
 
                 raise RuntimeError(
-                    f"Bybit API error "
-                    f"{data.get('retCode')}: "
-                    f"{data.get('retMsg')}"
+                    f"OKX API error "
+                    f"{data.get('code')}: "
+                    f"{data.get('msg')}"
                 )
 
             return data
 
-        except Exception as e:
+        except Exception:
 
-            if attempt == retries - 1:
+            if (
+                attempt
+                == retries - 1
+            ):
+
                 raise
 
             time.sleep(
-                1.5 * (attempt + 1)
+                1.0 * (attempt + 1)
             )
 
     return None
 
 
 # ============================================================
-# GET ALL BYBIT USDT PERPETUALS
+# GET ALL OKX USDT PERPETUALS
 # ============================================================
 
 def get_symbols():
 
-    symbols = []
-    cursor = None
-
-    while True:
-
-        params = {
-            "category": "linear",
-            "limit": 1000
+    data = get_json(
+        "/api/v5/public/instruments",
+        {
+            "instType": "SWAP"
         }
+    )
 
-        if cursor:
-            params["cursor"] = cursor
+    symbols = []
 
-        data = get_json(
-            "/v5/market/instruments-info",
-            params
+    for item in data["data"]:
+
+        inst_id = item.get(
+            "instId",
+            ""
         )
 
-        items = data["result"]["list"]
+        if (
+            item.get("state")
+            == "live"
 
-        for item in items:
+            and item.get("settleCcy")
+            == "USDT"
 
-            if (
-                item.get("status") == "Trading"
-                and item.get("contractType")
-                == "LinearPerpetual"
-                and item.get("quoteCoin") == "USDT"
-            ):
-                symbols.append(
-                    item["symbol"]
-                )
+            and item.get("ctType")
+            == "linear"
 
-        cursor = data["result"].get(
-            "nextPageCursor"
-        )
+            and inst_id.endswith(
+                "-USDT-SWAP"
+            )
+        ):
 
-        if not cursor:
-            break
+            symbols.append(
+                inst_id
+            )
 
-    return sorted(set(symbols))
+    return sorted(
+        set(symbols)
+    )
 
 
 # ============================================================
-# GET KLINES
+# GET OKX CANDLES
 # ============================================================
 
-def get_klines(
-    symbol,
-    interval,
+def get_candles(
+    inst_id,
+    bar,
     limit
 ):
 
     data = get_json(
-        "/v5/market/kline",
+        "/api/v5/market/candles",
         {
-            "category": "linear",
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
+            "instId": inst_id,
+            "bar": bar,
+            "limit": str(limit)
         }
     )
 
-    candles = data["result"]["list"]
+    candles = data["data"]
 
-    # Bybit returns newest first.
-    # Convert to oldest → newest.
-    return list(reversed(candles))
+    # OKX returns newest first.
+    # Convert to oldest -> newest.
+    return list(
+        reversed(candles)
+    )
 
 
 # ============================================================
 # EMA
 # ============================================================
 
-def calculate_ema(values, period):
+def calculate_ema(
+    values,
+    period
+):
 
     if len(values) < period:
+
         return None
 
-    multiplier = 2 / (period + 1)
+    multiplier = (
+        2 / (period + 1)
+    )
 
     ema = (
         sum(values[:period])
@@ -188,41 +292,70 @@ def calculate_ema(values, period):
 # DAILY VWAP
 # ============================================================
 
-def calculate_daily_vwap(candles):
+def calculate_daily_vwap(
+    candles
+):
 
     today = datetime.now(
         timezone.utc
     ).date()
 
     cumulative_pv = 0.0
+
     cumulative_volume = 0.0
 
     for candle in candles:
 
-        candle_time = datetime.fromtimestamp(
-            int(candle[0]) / 1000,
-            timezone.utc
+        candle_time = (
+            datetime.fromtimestamp(
+                int(candle[0]) / 1000,
+                timezone.utc
+            )
         )
 
-        if candle_time.date() != today:
+        if (
+            candle_time.date()
+            != today
+        ):
+
             continue
 
-        high = float(candle[2])
-        low = float(candle[3])
-        close = float(candle[4])
-        volume = float(candle[5])
-
-        typical_price = (
-            high + low + close
-        ) / 3
-
-        cumulative_pv += (
-            typical_price * volume
+        high = float(
+            candle[2]
         )
 
-        cumulative_volume += volume
+        low = float(
+            candle[3]
+        )
 
-    if cumulative_volume <= 0:
+        close = float(
+            candle[4]
+        )
+
+        volume = float(
+            candle[5]
+        )
+
+        typical_price = (
+            high
+            + low
+            + close
+        ) / 3.0
+
+        cumulative_pv += (
+            typical_price
+            * volume
+        )
+
+        cumulative_volume += (
+            volume
+        )
+
+    if (
+        cumulative_volume
+        <= 0
+    ):
+
         return None
 
     return (
@@ -243,19 +376,21 @@ def check_symbol(symbol):
         # 15M DATA
         # ----------------------------------------------------
 
-        candles = get_klines(
+        candles = get_candles(
             symbol,
-            TIMEFRAME_15M,
+            "15m",
             100
         )
 
         if len(candles) < 30:
+
             return None
 
-        # Ignore currently forming candle.
+        # Ignore currently forming candle
         completed = candles[:-1]
 
         current = completed[-1]
+
         previous = completed[-2]
 
         current_close = float(
@@ -276,20 +411,24 @@ def check_symbol(symbol):
 
         previous_volumes = [
             float(candle[5])
-            for candle in completed[
-                -21:-1
-            ]
+            for candle
+            in completed[-21:-1]
         ]
 
-        if len(previous_volumes) != 20:
+        if (
+            len(previous_volumes)
+            != VOLUME_LOOKBACK
+        ):
+
             return None
 
         average_volume = (
             sum(previous_volumes)
-            / 20
+            / VOLUME_LOOKBACK
         )
 
         if average_volume <= 0:
+
             return None
 
         volume_ratio = (
@@ -297,25 +436,34 @@ def check_symbol(symbol):
             / average_volume
         )
 
-        if volume_ratio <= 2.0:
+        if (
+            volume_ratio
+            <= VOLUME_MULTIPLIER
+        ):
+
             return None
 
         # ----------------------------------------------------
-        # VWAP
+        # DAILY VWAP
         # ----------------------------------------------------
 
-        current_vwap = calculate_daily_vwap(
-            completed
+        current_vwap = (
+            calculate_daily_vwap(
+                completed
+            )
         )
 
-        previous_vwap = calculate_daily_vwap(
-            completed[:-1]
+        previous_vwap = (
+            calculate_daily_vwap(
+                completed[:-1]
+            )
         )
 
         if (
             current_vwap is None
             or previous_vwap is None
         ):
+
             return None
 
         above_vwap = (
@@ -329,6 +477,7 @@ def check_symbol(symbol):
         )
 
         if not above_vwap:
+
             return None
 
         crossed_vwap = (
@@ -337,40 +486,46 @@ def check_symbol(symbol):
         )
 
         # ----------------------------------------------------
-        # ONLY AFTER 15M QUALIFIES:
-        # GET 1H EMA 200
+        # 1H EMA 200
         # ----------------------------------------------------
 
-        candles_1h = get_klines(
+        candles_1h = get_candles(
             symbol,
-            TIMEFRAME_1H,
+            "1H",
             210
         )
 
         if len(candles_1h) < 202:
+
             return None
 
-        completed_1h = candles_1h[:-1]
+        completed_1h = (
+            candles_1h[:-1]
+        )
 
         closes_1h = [
             float(candle[4])
-            for candle in completed_1h
+            for candle
+            in completed_1h
         ]
 
         ema200 = calculate_ema(
             closes_1h,
-            200
+            EMA_PERIOD
         )
 
-        ema200_previous = calculate_ema(
-            closes_1h[:-1],
-            200
+        ema200_previous = (
+            calculate_ema(
+                closes_1h[:-1],
+                EMA_PERIOD
+            )
         )
 
         if (
             ema200 is None
             or ema200_previous is None
         ):
+
             return None
 
         above_ema = (
@@ -379,6 +534,7 @@ def check_symbol(symbol):
         )
 
         if not above_ema:
+
             return None
 
         previous_above_ema = (
@@ -392,177 +548,229 @@ def check_symbol(symbol):
         )
 
         # ----------------------------------------------------
-        # ALL 3 CONDITIONS ARE TRUE
+        # ALL 3 CONDITIONS
         # ----------------------------------------------------
 
-        # Alert when price newly crosses either VWAP
-        # or the 1H EMA 200.
+        # Alert only when price newly crosses
+        # VWAP or 1H EMA 200.
+
         if not (
             crossed_vwap
             or crossed_ema
         ):
+
             return None
 
         return {
-            "symbol": symbol,
-            "price": current_close,
-            "vwap": current_vwap,
-            "ema200": ema200,
-            "volume_ratio": volume_ratio,
-            "crossed_vwap": crossed_vwap,
-            "crossed_ema": crossed_ema
+
+            "symbol":
+                symbol,
+
+            "price":
+                current_close,
+
+            "vwap":
+                current_vwap,
+
+            "ema200":
+                ema200,
+
+            "volume_ratio":
+                volume_ratio,
+
+            "crossed_vwap":
+                crossed_vwap,
+
+            "crossed_ema":
+                crossed_ema
         }
 
     except Exception as e:
 
         print(
-            f"Error checking {symbol}: {e}"
+            f"Error checking "
+            f"{symbol}: {e}"
         )
 
         return None
 
 
 # ============================================================
-# DISCORD ALERT
+# SPLIT DISCORD MESSAGE
 # ============================================================
 
-def send_discord_alert(results):
+def split_message(
+    message,
+    max_len=1900
+):
 
-    if not DISCORD_WEBHOOK:
-
-        raise RuntimeError(
-            "DISCORD_WEBHOOK_URL is missing."
-        )
-
-    if not results:
-        return
-
-    lines = []
-
-    lines.append(
-        "🚨 **CRYPTO ALERTS** 🚨"
-    )
-
-    lines.append(
-        f"**{len(results)} coins meet ALL 3 conditions**"
-    )
-
-    lines.append("")
-
-    for result in results:
-
-        crossed = []
-
-        if result["crossed_vwap"]:
-            crossed.append("VWAP")
-
-        if result["crossed_ema"]:
-            crossed.append("1H EMA 200")
-
-        lines.append(
-            f"🔔 **{result['symbol']}**"
-        )
-
-        lines.append(
-            f"💰 Price: `{result['price']:.8g}`"
-        )
-
-        lines.append(
-            f"📊 VWAP: `{result['vwap']:.8g}`"
-        )
-
-        lines.append(
-            f"📈 1H EMA 200: "
-            f"`{result['ema200']:.8g}`"
-        )
-
-        lines.append(
-            f"🔥 15M Volume: "
-            f"`{result['volume_ratio']:.2f}x`"
-        )
-
-        lines.append(
-            "✅ VWAP | "
-            "✅ EMA 200 | "
-            "✅ Volume >2x"
-        )
-
-        lines.append(
-            f"📍 Crossed: "
-            f"**{' + '.join(crossed)}**"
-        )
-
-        lines.append("")
-
-    message = "\n".join(lines)
-
-    # Discord content limit is 2000 characters.
-    # Split safely if necessary.
     chunks = []
 
-    while len(message) > 1900:
+    while len(message) > max_len:
 
         split_at = message.rfind(
             "\n\n",
             0,
-            1900
+            max_len
         )
 
         if split_at == -1:
-            split_at = 1900
+
+            split_at = message.rfind(
+                "\n",
+                0,
+                max_len
+            )
+
+        if split_at == -1:
+
+            split_at = max_len
 
         chunks.append(
             message[:split_at]
         )
 
-        message = message[
-            split_at:
-        ].lstrip()
+        message = (
+            message[split_at:]
+            .lstrip()
+        )
 
     if message:
-        chunks.append(message)
+
+        chunks.append(
+            message
+        )
+
+    return chunks
+
+
+# ============================================================
+# DISCORD ALERT
+# ============================================================
+
+def send_discord_alert(
+    results
+):
+
+    if not DISCORD_WEBHOOK:
+
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL "
+            "is missing."
+        )
+
+    lines = [
+
+        "🚨 **CRYPTO ALERTS** 🚨",
+
+        f"**{len(results)} coins "
+        f"meet ALL 3 conditions**",
+
+        ""
+    ]
+
+    for result in results:
+
+        crossed = []
+
+        if result[
+            "crossed_vwap"
+        ]:
+
+            crossed.append(
+                "VWAP"
+            )
+
+        if result[
+            "crossed_ema"
+        ]:
+
+            crossed.append(
+                "1H EMA 200"
+            )
+
+        lines += [
+
+            f"🔔 **{result['symbol']}**",
+
+            f"💰 Price: "
+            f"`{result['price']:.8g}`",
+
+            f"📊 VWAP: "
+            f"`{result['vwap']:.8g}`",
+
+            f"📈 1H EMA 200: "
+            f"`{result['ema200']:.8g}`",
+
+            f"🔥 15M Volume: "
+            f"`{result['volume_ratio']:.2f}x`",
+
+            "✅ VWAP | "
+            "✅ EMA 200 | "
+            "✅ Volume >2x",
+
+            f"📍 Crossed: "
+            f"**{' + '.join(crossed)}**",
+
+            ""
+        ]
+
+    message = "\n".join(
+        lines
+    )
+
+    chunks = split_message(
+        message
+    )
 
     for chunk in chunks:
 
-        payload = {
-            "content": chunk
-        }
+        for attempt in range(4):
 
-        response = session.post(
-            DISCORD_WEBHOOK,
-            json=payload,
-            timeout=15
-        )
+            response = (
+                get_session().post(
+                    DISCORD_WEBHOOK,
+                    json={
+                        "content": chunk
+                    },
+                    timeout=15
+                )
+            )
 
-        # Discord rate-limit protection.
-        if response.status_code == 429:
+            if (
+                response.status_code
+                != 429
+            ):
+
+                response.raise_for_status()
+
+                break
 
             try:
+
                 retry_after = float(
                     response.json().get(
                         "retry_after",
                         2
                     )
                 )
+
             except Exception:
+
                 retry_after = 2
 
             print(
-                f"Discord rate limit. "
-                f"Waiting {retry_after}s..."
+                "Discord rate limit. "
+                f"Waiting "
+                f"{retry_after:.2f}s..."
             )
 
             time.sleep(
                 retry_after + 1
             )
 
-            response = session.post(
-                DISCORD_WEBHOOK,
-                json=payload,
-                timeout=15
-            )
-
-        response.raise_for_status()
+        # Small pause between Discord messages
+        time.sleep(0.75)
 
 
 # ============================================================
@@ -574,19 +782,24 @@ def main():
     start_time = time.time()
 
     print("=" * 60)
+
     print(
-        "BYBIT VWAP + EMA200 + VOLUME SCANNER"
+        "OKX VWAP + EMA200 + "
+        "VOLUME SCANNER"
     )
+
     print("=" * 60)
 
     if not DISCORD_WEBHOOK:
 
         raise RuntimeError(
-            "DISCORD_WEBHOOK_URL is missing."
+            "DISCORD_WEBHOOK_URL "
+            "is missing."
         )
 
     print(
-        "Getting Bybit USDT perpetual symbols..."
+        "Getting OKX USDT "
+        "perpetual symbols..."
     )
 
     symbols = get_symbols()
@@ -609,10 +822,12 @@ def main():
     ) as executor:
 
         futures = {
+
             executor.submit(
                 check_symbol,
                 symbol
             ): symbol
+
             for symbol in symbols
         }
 
@@ -620,14 +835,21 @@ def main():
             futures
         ):
 
-            symbol = futures[future]
+            symbol = futures[
+                future
+            ]
 
             try:
 
-                result = future.result()
+                result = (
+                    future.result()
+                )
 
                 if result:
-                    results.append(result)
+
+                    results.append(
+                        result
+                    )
 
             except Exception as e:
 
@@ -649,19 +871,24 @@ def main():
                     f"{len(symbols)}"
                 )
 
-    # Keep alerts in alphabetical order.
+    # --------------------------------------------------------
+    # SORT RESULTS
+    # --------------------------------------------------------
+
     results.sort(
-        key=lambda x: x["symbol"]
+        key=lambda x:
+            x["symbol"]
     )
 
     print()
+
     print(
         f"Setups found: "
         f"{len(results)}"
     )
 
     # --------------------------------------------------------
-    # SEND ONE CONSOLIDATED DISCORD ALERT
+    # SEND DISCORD
     # --------------------------------------------------------
 
     if results:
@@ -681,9 +908,13 @@ def main():
     else:
 
         print(
-            "No coins currently meet "
-            "all conditions."
+            "No coins currently "
+            "meet all conditions."
         )
+
+    # --------------------------------------------------------
+    # TIME
+    # --------------------------------------------------------
 
     elapsed = (
         time.time()
@@ -691,6 +922,7 @@ def main():
     )
 
     print()
+
     print(
         f"Total scan time: "
         f"{elapsed:.1f} seconds"
@@ -699,5 +931,10 @@ def main():
     print("=" * 60)
 
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
