@@ -1,5 +1,9 @@
 name: Crypto Discord Scanner
 
+concurrency:
+  group: crypto-scanner
+  cancel-in-progress: false
+
 on:
   schedule:
     - cron: "*/5 * * * *"
