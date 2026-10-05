@@ -3,35 +3,46 @@ import time
 import requests
 from datetime import datetime, timezone
 
+
 # ============================================================
 # SETTINGS
 # ============================================================
 
-BINANCE_BASE = "https://fapi.binance.com"
+BYBIT_BASE = "https://api.bybit.com"
 
-TIMEFRAME_15M = "15m"
-TIMEFRAME_1H = "1h"
+TIMEFRAME_15M = "15"
+TIMEFRAME_1H = "60"
 
 EMA_PERIOD = 200
 VOLUME_LOOKBACK = 20
 VOLUME_MULTIPLIER = 2.0
 
-# Discord webhook stored safely in GitHub Secrets
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
+
 
 # ============================================================
 # HTTP SESSION
 # ============================================================
 
 session = requests.Session()
+
 session.headers.update({
     "User-Agent": "Crypto-Discord-Scanner/1.0"
 })
 
 
-def get_json(url, params=None, retries=3):
+# ============================================================
+# GET JSON FROM BYBIT
+# ============================================================
+
+def get_json(endpoint, params=None, retries=3):
+
+    url = f"{BYBIT_BASE}{endpoint}"
+
     for attempt in range(retries):
+
         try:
+
             response = session.get(
                 url,
                 params=params,
@@ -39,11 +50,28 @@ def get_json(url, params=None, retries=3):
             )
 
             response.raise_for_status()
-            return response.json()
+
+            data = response.json()
+
+            if data.get("retCode") != 0:
+
+                raise RuntimeError(
+                    f"Bybit API error: "
+                    f"{data.get('retCode')} - "
+                    f"{data.get('retMsg')}"
+                )
+
+            return data
 
         except Exception as e:
+
             if attempt == retries - 1:
                 raise
+
+            print(
+                f"Request error: {e}. "
+                f"Retrying..."
+            )
 
             time.sleep(2)
 
@@ -51,62 +79,106 @@ def get_json(url, params=None, retries=3):
 
 
 # ============================================================
-# GET ALL USDT-M PERPETUAL SYMBOLS
+# GET ALL BYBIT USDT PERPETUALS
 # ============================================================
 
 def get_symbols():
 
-    data = get_json(
-        f"{BINANCE_BASE}/fapi/v1/exchangeInfo"
-    )
-
     symbols = []
 
-    for item in data["symbols"]:
+    cursor = None
 
-        if (
-            item["status"] == "TRADING"
-            and item["contractType"] == "PERPETUAL"
-            and item["quoteAsset"] == "USDT"
-        ):
-            symbols.append(item["symbol"])
+    while True:
 
-    return symbols
+        params = {
+            "category": "linear",
+            "limit": 1000
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        data = get_json(
+            "/v5/market/instruments-info",
+            params
+        )
+
+        items = data["result"]["list"]
+
+        for item in items:
+
+            if (
+                item.get("status") == "Trading"
+                and item.get("contractType")
+                == "LinearPerpetual"
+                and item.get("quoteCoin") == "USDT"
+            ):
+
+                symbols.append(
+                    item["symbol"]
+                )
+
+        cursor = data["result"].get(
+            "nextPageCursor"
+        )
+
+        if not cursor:
+            break
+
+    return sorted(set(symbols))
 
 
 # ============================================================
 # GET KLINES
 # ============================================================
 
-def get_klines(symbol, interval, limit):
+def get_klines(
+    symbol,
+    interval,
+    limit
+):
 
-    return get_json(
-        f"{BINANCE_BASE}/fapi/v1/klines",
+    data = get_json(
+        "/v5/market/kline",
         {
+            "category": "linear",
             "symbol": symbol,
             "interval": interval,
             "limit": limit
         }
     )
 
+    # Bybit returns newest candle first.
+    candles = data["result"]["list"]
+
+    return list(reversed(candles))
+
 
 # ============================================================
-# EMA CALCULATION
+# EMA
 # ============================================================
 
-def calculate_ema(values, period):
+def calculate_ema(
+    values,
+    period
+):
 
     if len(values) < period:
         return None
 
     multiplier = 2 / (period + 1)
 
-    # Initial SMA
-    ema = sum(values[:period]) / period
+    ema = sum(
+        values[:period]
+    ) / period
 
-    # Continue EMA
     for price in values[period:]:
-        ema = (price - ema) * multiplier + ema
+
+        ema = (
+            (price - ema)
+            * multiplier
+            + ema
+        )
 
     return ema
 
@@ -115,22 +187,25 @@ def calculate_ema(values, period):
 # DAILY VWAP
 # ============================================================
 
-def calculate_daily_vwap(klines):
+def calculate_daily_vwap(
+    candles
+):
 
-    now = datetime.now(timezone.utc)
+    today = datetime.now(
+        timezone.utc
+    ).date()
 
     cumulative_pv = 0.0
     cumulative_volume = 0.0
 
-    for candle in klines:
+    for candle in candles:
 
-        open_time = datetime.fromtimestamp(
-            candle[0] / 1000,
+        candle_time = datetime.fromtimestamp(
+            int(candle[0]) / 1000,
             timezone.utc
         )
 
-        # Only today's candles
-        if open_time.date() != now.date():
+        if candle_time.date() != today:
             continue
 
         high = float(candle[2])
@@ -138,192 +213,253 @@ def calculate_daily_vwap(klines):
         close = float(candle[4])
         volume = float(candle[5])
 
-        typical_price = (high + low + close) / 3
+        typical_price = (
+            high + low + close
+        ) / 3
 
-        cumulative_pv += typical_price * volume
+        cumulative_pv += (
+            typical_price * volume
+        )
+
         cumulative_volume += volume
 
-    if cumulative_volume == 0:
+    if cumulative_volume <= 0:
         return None
 
-    return cumulative_pv / cumulative_volume
+    return (
+        cumulative_pv
+        / cumulative_volume
+    )
 
 
 # ============================================================
-# CHECK ONE SYMBOL
+# CHECK 15M CONDITIONS
+# ============================================================
+
+def check_15m_conditions(symbol):
+
+    candles = get_klines(
+        symbol,
+        TIMEFRAME_15M,
+        100
+    )
+
+    # Remove the currently forming candle.
+    if len(candles) < 30:
+        return None
+
+    completed = candles[:-1]
+
+    current = completed[-1]
+    previous = completed[-2]
+
+    current_close = float(
+        current[4]
+    )
+
+    previous_close = float(
+        previous[4]
+    )
+
+    current_volume = float(
+        current[5]
+    )
+
+    # --------------------------------------------------------
+    # VOLUME
+    # Current completed 15m candle must be > 2x
+    # average volume of the previous 20 candles.
+    # --------------------------------------------------------
+
+    previous_volumes = [
+        float(candle[5])
+        for candle in completed[
+            -21:-1
+        ]
+    ]
+
+    if len(previous_volumes) < VOLUME_LOOKBACK:
+        return None
+
+    average_volume = (
+        sum(previous_volumes)
+        / len(previous_volumes)
+    )
+
+    if average_volume <= 0:
+        return None
+
+    volume_ratio = (
+        current_volume
+        / average_volume
+    )
+
+    if volume_ratio <= VOLUME_MULTIPLIER:
+        return None
+
+    # --------------------------------------------------------
+    # VWAP
+    # --------------------------------------------------------
+
+    current_vwap = calculate_daily_vwap(
+        completed
+    )
+
+    previous_vwap = calculate_daily_vwap(
+        completed[:-1]
+    )
+
+    if (
+        current_vwap is None
+        or previous_vwap is None
+    ):
+        return None
+
+    current_above_vwap = (
+        current_close > current_vwap
+    )
+
+    previous_above_vwap = (
+        previous_close > previous_vwap
+    )
+
+    # Must be above VWAP now.
+    if not current_above_vwap:
+        return None
+
+    # --------------------------------------------------------
+    # 15M VWAP CROSS
+    # --------------------------------------------------------
+
+    crossed_vwap = (
+        not previous_above_vwap
+        and current_above_vwap
+    )
+
+    return {
+        "symbol": symbol,
+        "price": current_close,
+        "vwap": current_vwap,
+        "volume_ratio": volume_ratio,
+        "crossed_vwap": crossed_vwap
+    }
+
+
+# ============================================================
+# CHECK 1H EMA 200
+# ============================================================
+
+def check_ema200(symbol):
+
+    candles = get_klines(
+        symbol,
+        TIMEFRAME_1H,
+        210
+    )
+
+    if len(candles) < EMA_PERIOD + 2:
+        return None
+
+    # Remove current unfinished 1H candle.
+    completed = candles[:-1]
+
+    closes = [
+        float(candle[4])
+        for candle in completed
+    ]
+
+    current_price = closes[-1]
+
+    ema_current = calculate_ema(
+        closes,
+        EMA_PERIOD
+    )
+
+    ema_previous = calculate_ema(
+        closes[:-1],
+        EMA_PERIOD
+    )
+
+    if (
+        ema_current is None
+        or ema_previous is None
+    ):
+        return None
+
+    above_ema = (
+        current_price > ema_current
+    )
+
+    previous_above_ema = (
+        closes[-2] > ema_previous
+    )
+
+    if not above_ema:
+        return None
+
+    crossed_ema = (
+        not previous_above_ema
+        and above_ema
+    )
+
+    return {
+        "ema200": ema_current,
+        "crossed_ema": crossed_ema
+    }
+
+
+# ============================================================
+# FULL SYMBOL CHECK
 # ============================================================
 
 def check_symbol(symbol):
 
     try:
 
-        # ----------------------------------------------------
-        # 15 MINUTE DATA
-        # Need enough candles for VWAP + volume comparison
-        # ----------------------------------------------------
-
-        candles_15m = get_klines(
-            symbol,
-            TIMEFRAME_15M,
-            100
+        # First check 15m conditions.
+        data_15m = check_15m_conditions(
+            symbol
         )
 
-        if len(candles_15m) < 30:
+        if data_15m is None:
             return None
 
-        # Binance's last candle may still be forming.
-        # Remove it and use only completed candles.
-        completed_15m = candles_15m[:-1]
-
-        current = completed_15m[-1]
-        previous = completed_15m[-2]
-
-        current_close = float(current[4])
-        previous_close = float(previous[4])
-
-        current_volume = float(current[5])
-
-        # ----------------------------------------------------
-        # VOLUME CONDITION
-        # Current completed candle volume must be > 2x
-        # average of previous 20 completed candles
-        # ----------------------------------------------------
-
-        previous_volumes = [
-            float(candle[5])
-            for candle in completed_15m[-21:-1]
-        ]
-
-        average_volume = (
-            sum(previous_volumes)
-            / len(previous_volumes)
+        # Then check 1H EMA 200.
+        data_ema = check_ema200(
+            symbol
         )
 
-        volume_ratio = (
-            current_volume / average_volume
-            if average_volume > 0
-            else 0
-        )
-
-        volume_condition = (
-            volume_ratio > VOLUME_MULTIPLIER
-        )
-
-        if not volume_condition:
+        if data_ema is None:
             return None
 
         # ----------------------------------------------------
-        # DAILY VWAP
+        # ALL 3 CONDITIONS ARE NOW TRUE:
+        #
+        # 1. Above VWAP
+        # 2. Above 1H EMA 200
+        # 3. Volume > 2x average
         # ----------------------------------------------------
 
-        vwap = calculate_daily_vwap(completed_15m)
-
-        if vwap is None:
-            return None
-
-        current_above_vwap = current_close > vwap
-        previous_vwap = calculate_daily_vwap(
-            completed_15m[:-1]
-        )
-
-        if previous_vwap is None:
-            return None
-
-        previous_above_vwap = previous_close > previous_vwap
-
-        # ----------------------------------------------------
-        # 1H EMA 200
-        # ----------------------------------------------------
-
-        candles_1h = get_klines(
-            symbol,
-            TIMEFRAME_1H,
-            210
-        )
-
-        if len(candles_1h) < EMA_PERIOD + 2:
-            return None
-
-        # Remove currently forming 1H candle
-        completed_1h = candles_1h[:-1]
-
-        closes_1h = [
-            float(candle[4])
-            for candle in completed_1h
-        ]
-
-        ema200_current = calculate_ema(
-            closes_1h,
-            EMA_PERIOD
-        )
-
-        ema200_previous = calculate_ema(
-            closes_1h[:-1],
-            EMA_PERIOD
-        )
-
-        if (
-            ema200_current is None
-            or ema200_previous is None
+        # Alert only when price has newly crossed
+        # VWAP or EMA 200.
+        if not (
+            data_15m["crossed_vwap"]
+            or data_ema["crossed_ema"]
         ):
             return None
 
-        current_above_ema = (
-            current_close > ema200_current
-        )
-
-        previous_above_ema = (
-            previous_close > ema200_previous
-        )
-
-        # ----------------------------------------------------
-        # ALL THREE CONDITIONS
-        # ----------------------------------------------------
-
-        all_conditions = (
-            current_above_vwap
-            and current_above_ema
-            and volume_condition
-        )
-
-        if not all_conditions:
-            return None
-
-        # ----------------------------------------------------
-        # CROSSING CONDITION
-        #
-        # Alert when the coin has just moved above VWAP
-        # OR just moved above the 1H EMA 200.
-        #
-        # This prevents repeated alerts while price remains
-        # above both levels.
-        # ----------------------------------------------------
-
-        crossed_vwap = (
-            not previous_above_vwap
-            and current_above_vwap
-        )
-
-        crossed_ema = (
-            not previous_above_ema
-            and current_above_ema
-        )
-
-        if not (crossed_vwap or crossed_ema):
-            return None
-
-        # ----------------------------------------------------
-        # RESULT
-        # ----------------------------------------------------
-
         return {
             "symbol": symbol,
-            "price": current_close,
-            "vwap": vwap,
-            "ema200": ema200_current,
-            "volume_ratio": volume_ratio,
-            "crossed_vwap": crossed_vwap,
-            "crossed_ema": crossed_ema
+            "price": data_15m["price"],
+            "vwap": data_15m["vwap"],
+            "ema200": data_ema["ema200"],
+            "volume_ratio": data_15m[
+                "volume_ratio"
+            ],
+            "crossed_vwap":
+                data_15m["crossed_vwap"],
+            "crossed_ema":
+                data_ema["crossed_ema"]
         }
 
     except Exception as e:
@@ -336,23 +472,19 @@ def check_symbol(symbol):
 
 
 # ============================================================
-# DISCORD ALERT
+# DISCORD
 # ============================================================
 
 def send_discord_alert(results):
 
     if not DISCORD_WEBHOOK:
+
         raise RuntimeError(
-            "DISCORD_WEBHOOK_URL secret is missing."
+            "DISCORD_WEBHOOK_URL secret "
+            "is missing."
         )
 
     for result in results:
-
-        symbol = result["symbol"]
-        price = result["price"]
-        vwap = result["vwap"]
-        ema200 = result["ema200"]
-        volume_ratio = result["volume_ratio"]
 
         crossed = []
 
@@ -360,37 +492,48 @@ def send_discord_alert(results):
             crossed.append("VWAP")
 
         if result["crossed_ema"]:
-            crossed.append("1H EMA 200")
-
-        crossed_text = " + ".join(crossed)
+            crossed.append(
+                "1H EMA 200"
+            )
 
         message = (
-            f"🚨 **CRYPTO BREAKOUT ALERT** 🚨\n\n"
-            f"**{symbol}**\n\n"
-            f"💰 Price: `{price:.8g}`\n"
-            f"📊 VWAP: `{vwap:.8g}`\n"
-            f"📈 1H EMA 200: `{ema200:.8g}`\n"
-            f"🔥 15M Volume: `{volume_ratio:.2f}x`\n\n"
-            f"✅ Above VWAP\n"
-            f"✅ Above 1H EMA 200\n"
-            f"✅ Volume > 2x average\n"
-            f"🔔 Crossed: **{crossed_text}**"
-        )
+            "🚨 **CRYPTO ALERT** 🚨\n\n"
 
-        payload = {
-            "content": message
-        }
+            f"**{result['symbol']}**\n\n"
+
+            f"💰 Price: "
+            f"`{result['price']:.8g}`\n"
+
+            f"📊 VWAP: "
+            f"`{result['vwap']:.8g}`\n"
+
+            f"📈 1H EMA 200: "
+            f"`{result['ema200']:.8g}`\n"
+
+            f"🔥 15M Volume: "
+            f"`{result['volume_ratio']:.2f}x`\n\n"
+
+            "✅ Above VWAP\n"
+            "✅ Above 1H EMA 200\n"
+            "✅ Volume > 2x average\n\n"
+
+            f"🔔 Crossed: "
+            f"**{' + '.join(crossed)}**"
+        )
 
         response = session.post(
             DISCORD_WEBHOOK,
-            json=payload,
+            json={
+                "content": message
+            },
             timeout=15
         )
 
         response.raise_for_status()
 
         print(
-            f"Discord alert sent: {symbol}"
+            f"Discord alert sent: "
+            f"{result['symbol']}"
         )
 
 
@@ -401,53 +544,76 @@ def send_discord_alert(results):
 def main():
 
     print("=" * 60)
-    print("CRYPTO VWAP + EMA200 + VOLUME SCANNER")
+    print(
+        "BYBIT VWAP + EMA200 + VOLUME SCANNER"
+    )
     print("=" * 60)
 
     if not DISCORD_WEBHOOK:
+
         print(
-            "ERROR: DISCORD_WEBHOOK_URL is not configured."
+            "ERROR: "
+            "DISCORD_WEBHOOK_URL is missing."
         )
+
         return
 
-    print("Getting Binance USDT perpetual symbols...")
+    print(
+        "Getting Bybit USDT perpetual symbols..."
+    )
 
     symbols = get_symbols()
 
     print(
-        f"Found {len(symbols)} USDT perpetual symbols."
+        f"Found {len(symbols)} "
+        "USDT perpetual symbols."
     )
 
     results = []
 
-    for index, symbol in enumerate(symbols, start=1):
+    for index, symbol in enumerate(
+        symbols,
+        start=1
+    ):
 
         print(
-            f"[{index}/{len(symbols)}] Checking {symbol}"
+            f"[{index}/{len(symbols)}] "
+            f"Checking {symbol}"
         )
 
-        result = check_symbol(symbol)
+        result = check_symbol(
+            symbol
+        )
 
         if result:
             results.append(result)
 
     print()
     print(
-        f"Setups found: {len(results)}"
+        f"Setups found: "
+        f"{len(results)}"
     )
 
     if results:
-        send_discord_alert(results)
+
+        send_discord_alert(
+            results
+        )
 
         for result in results:
+
             print(
-                f"ALERT: {result['symbol']} "
-                f"| Volume {result['volume_ratio']:.2f}x"
+                f"ALERT: "
+                f"{result['symbol']} | "
+                f"Volume "
+                f"{result['volume_ratio']:.2f}x"
             )
 
     else:
+
         print(
-            "No coins currently meet all conditions."
+            "No coins currently meet "
+            "all conditions."
         )
 
     print("=" * 60)
