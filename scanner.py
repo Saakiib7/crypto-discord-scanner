@@ -16,16 +16,16 @@ DISCORD_WEBHOOK = os.environ.get(
     "DISCORD_WEBHOOK_URL"
 )
 
-EMA_PERIOD = 200
+FAST_EMA = 9
+SLOW_EMA = 16
 
 VOLUME_LOOKBACK = 20
-
 VOLUME_MULTIPLIER = 2.0
 
 MAX_WORKERS = 15
 
-# BloFin REST limit is 500 requests/minute.
-# Stay safely below it.
+# BloFin public REST rate limit
+# Stay safely below 500 requests/minute.
 MAX_REQUESTS_PER_MINUTE = 450
 
 REQUEST_INTERVAL = (
@@ -34,7 +34,7 @@ REQUEST_INTERVAL = (
 
 
 # ============================================================
-# GLOBAL RATE LIMITER
+# RATE LIMITER
 # ============================================================
 
 _last_request_time = 0.0
@@ -82,7 +82,7 @@ def get_session():
 
         session.headers.update({
             "User-Agent":
-                "Crypto-Discord-Scanner/4.0"
+                "Crypto-Discord-EMA-Scanner/5.0"
         })
 
         _thread_local.session = session
@@ -116,7 +116,6 @@ def get_json(
                 timeout=15
             )
 
-            # BloFin firewall / rate limit
             if response.status_code == 429:
 
                 print(
@@ -143,7 +142,9 @@ def get_json(
 
             data = response.json()
 
-            if str(data.get("code")) != "0":
+            if str(
+                data.get("code")
+            ) != "0":
 
                 raise RuntimeError(
                     f"BloFin API error "
@@ -155,7 +156,10 @@ def get_json(
 
         except Exception as e:
 
-            if attempt == retries - 1:
+            if (
+                attempt
+                == retries - 1
+            ):
 
                 raise
 
@@ -215,20 +219,19 @@ def get_symbols():
 
 
 # ============================================================
-# GET CANDLES
+# GET 15M CANDLES
 # ============================================================
 
 def get_candles(
     symbol,
-    timeframe,
-    limit
+    limit=100
 ):
 
     data = get_json(
         "/api/v1/market/candles",
         {
             "instId": symbol,
-            "bar": timeframe,
+            "bar": "15m",
             "limit": str(limit)
         }
     )
@@ -237,9 +240,11 @@ def get_candles(
 
     # BloFin returns newest first.
     # Convert to oldest -> newest.
-    return list(
+    candles = list(
         reversed(candles)
     )
+
+    return candles
 
 
 # ============================================================
@@ -259,6 +264,7 @@ def calculate_ema(
         2.0 / (period + 1)
     )
 
+    # Initial SMA
     ema = (
         sum(values[:period])
         / period
@@ -276,67 +282,28 @@ def calculate_ema(
 
 
 # ============================================================
-# DAILY VWAP
+# CHECK WHETHER CANDLE IS COMPLETED
 # ============================================================
 
-def calculate_daily_vwap(
-    candles
-):
+def is_completed(candle):
 
-    today = datetime.now(
-        timezone.utc
-    ).date()
-
-    cumulative_pv = 0.0
-
-    cumulative_volume = 0.0
-
-    for candle in candles:
-
-        candle_time = (
-            datetime.fromtimestamp(
-                int(candle[0]) / 1000,
-                timezone.utc
-            )
-        )
-
-        if (
-            candle_time.date()
-            != today
-        ):
-
-            continue
-
-        high = float(candle[2])
-
-        low = float(candle[3])
-
-        close = float(candle[4])
-
-        volume = float(candle[5])
-
-        typical_price = (
-            high
-            + low
-            + close
-        ) / 3.0
-
-        cumulative_pv += (
-            typical_price
-            * volume
-        )
-
-        cumulative_volume += (
-            volume
-        )
-
-    if cumulative_volume <= 0:
-
-        return None
+    # BloFin candle structure:
+    #
+    # 0 = timestamp
+    # 1 = open
+    # 2 = high
+    # 3 = low
+    # 4 = close
+    # 5 = volume
+    # 6 = base volume
+    # 7 = quote volume
+    # 8 = confirm
+    #
+    # confirm = 1 means completed.
 
     return (
-        cumulative_pv
-        / cumulative_volume
+        len(candle) >= 9
+        and str(candle[8]) == "1"
     )
 
 
@@ -348,13 +315,8 @@ def check_symbol(symbol):
 
     try:
 
-        # ----------------------------------------------------
-        # 15M DATA
-        # ----------------------------------------------------
-
         candles = get_candles(
             symbol,
-            "15m",
             100
         )
 
@@ -362,12 +324,28 @@ def check_symbol(symbol):
 
             return None
 
-        # Ignore current incomplete candle
-        completed = candles[:-1]
+        # ----------------------------------------------------
+        # USE ONLY COMPLETED 15M CANDLES
+        # ----------------------------------------------------
 
-        if len(completed) < 22:
+        completed = [
+
+            candle
+
+            for candle
+            in candles
+
+            if is_completed(candle)
+
+        ]
+
+        if len(completed) < 25:
 
             return None
+
+        # ----------------------------------------------------
+        # LATEST CLOSED CANDLE
+        # ----------------------------------------------------
 
         current = completed[-1]
 
@@ -381,28 +359,114 @@ def check_symbol(symbol):
             previous[4]
         )
 
-        current_volume = float(
-            current[5]
+        # ----------------------------------------------------
+        # 9 EMA
+        # ----------------------------------------------------
+
+        closes = [
+
+            float(candle[4])
+
+            for candle
+            in completed
+
+        ]
+
+        ema9 = calculate_ema(
+            closes,
+            FAST_EMA
         )
 
+        ema16 = calculate_ema(
+            closes,
+            SLOW_EMA
+        )
+
+        previous_closes = closes[:-1]
+
+        previous_ema9 = calculate_ema(
+            previous_closes,
+            FAST_EMA
+        )
+
+        previous_ema16 = calculate_ema(
+            previous_closes,
+            SLOW_EMA
+        )
+
+        if (
+            ema9 is None
+            or ema16 is None
+            or previous_ema9 is None
+            or previous_ema16 is None
+        ):
+
+            return None
+
         # ----------------------------------------------------
-        # VOLUME SURGE
+        # CROSSOVER
         # ----------------------------------------------------
+
+        bullish_cross = (
+
+            previous_ema9
+            <= previous_ema16
+
+            and
+
+            ema9
+            > ema16
+
+        )
+
+        bearish_cross = (
+
+            previous_ema9
+            >= previous_ema16
+
+            and
+
+            ema9
+            < ema16
+
+        )
+
+        if not (
+            bullish_cross
+            or bearish_cross
+        ):
+
+            return None
+
+        # ----------------------------------------------------
+        # VOLUME
+        # ----------------------------------------------------
+
+        # Previous 20 completed candles.
+        # Do NOT include the signal candle.
+
+        volume_candles = completed[
+            -21:-1
+        ]
+
+        if len(
+            volume_candles
+        ) != VOLUME_LOOKBACK:
+
+            return None
 
         previous_volumes = [
 
             float(candle[5])
 
             for candle
-            in completed[-21:-1]
+            in volume_candles
 
         ]
 
-        if len(
-            previous_volumes
-        ) != VOLUME_LOOKBACK:
-
-            return None
+        current_volume = float(
+            current[5]
+        )
 
         average_volume = (
             sum(previous_volumes)
@@ -418,6 +482,7 @@ def check_symbol(symbol):
             / average_volume
         )
 
+        # Must be STRICTLY greater than 2x.
         if (
             volume_ratio
             <= VOLUME_MULTIPLIER
@@ -426,145 +491,52 @@ def check_symbol(symbol):
             return None
 
         # ----------------------------------------------------
-        # DAILY VWAP
+        # CANDLE TIME
         # ----------------------------------------------------
 
-        current_vwap = (
-            calculate_daily_vwap(
-                completed
+        candle_timestamp = int(
+            current[0]
+        )
+
+        candle_time = (
+            datetime.fromtimestamp(
+                candle_timestamp / 1000,
+                timezone.utc
             )
         )
-
-        previous_vwap = (
-            calculate_daily_vwap(
-                completed[:-1]
-            )
-        )
-
-        if (
-            current_vwap is None
-            or previous_vwap is None
-        ):
-
-            return None
-
-        above_vwap = (
-            current_close
-            > current_vwap
-        )
-
-        previous_above_vwap = (
-            previous_close
-            > previous_vwap
-        )
-
-        if not above_vwap:
-
-            return None
-
-        crossed_vwap = (
-            not previous_above_vwap
-            and above_vwap
-        )
-
-        # ----------------------------------------------------
-        # ONLY NOW REQUEST 1H DATA
-        # ----------------------------------------------------
-
-        candles_1h = get_candles(
-            symbol,
-            "1H",
-            210
-        )
-
-        if len(candles_1h) < 202:
-
-            return None
-
-        completed_1h = (
-            candles_1h[:-1]
-        )
-
-        closes_1h = [
-
-            float(candle[4])
-
-            for candle
-            in completed_1h
-
-        ]
-
-        ema200 = calculate_ema(
-            closes_1h,
-            EMA_PERIOD
-        )
-
-        ema200_previous = (
-            calculate_ema(
-                closes_1h[:-1],
-                EMA_PERIOD
-            )
-        )
-
-        if (
-            ema200 is None
-            or ema200_previous is None
-        ):
-
-            return None
-
-        above_ema = (
-            current_close
-            > ema200
-        )
-
-        if not above_ema:
-
-            return None
-
-        previous_above_ema = (
-            previous_close
-            > ema200_previous
-        )
-
-        crossed_ema = (
-            not previous_above_ema
-            and above_ema
-        )
-
-        # ----------------------------------------------------
-        # FINAL SIGNAL
-        # ----------------------------------------------------
-
-        if not (
-            crossed_vwap
-            or crossed_ema
-        ):
-
-            return None
 
         return {
 
             "symbol":
                 symbol,
 
+            "direction":
+                (
+                    "BULLISH"
+                    if bullish_cross
+                    else "BEARISH"
+                ),
+
             "price":
                 current_close,
 
-            "vwap":
-                current_vwap,
+            "ema9":
+                ema9,
 
-            "ema200":
-                ema200,
+            "ema16":
+                ema16,
 
             "volume_ratio":
                 volume_ratio,
 
-            "crossed_vwap":
-                crossed_vwap,
+            "candle_time":
+                candle_time.strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                ),
 
-            "crossed_ema":
-                crossed_ema
+            "candle_timestamp":
+                candle_timestamp
+
         }
 
     except Exception as e:
@@ -575,6 +547,39 @@ def check_symbol(symbol):
         )
 
         return None
+
+
+# ============================================================
+# CHECK WHETHER SIGNAL CANDLE IS RECENT
+# ============================================================
+
+def is_recent_closed_candle(
+    result
+):
+
+    candle_timestamp = (
+        result["candle_timestamp"]
+    )
+
+    now = time.time()
+
+    age = (
+        now
+        - candle_timestamp / 1000
+    )
+
+    # Only alert for a recently closed candle.
+    #
+    # This prevents the same crossover from
+    # triggering again on the next 5-minute scan.
+    #
+    # Maximum 9 minutes old.
+
+    return (
+        0
+        <= age
+        < 9 * 60
+    )
 
 
 # ============================================================
@@ -627,7 +632,7 @@ def split_message(
 
 
 # ============================================================
-# DISCORD ALERT
+# SEND DISCORD ALERT
 # ============================================================
 
 def send_discord_alert(
@@ -643,56 +648,59 @@ def send_discord_alert(
 
     lines = [
 
-        "🚨 **BLOFIN CRYPTO ALERTS** 🚨",
+        "⚡ **BLOFIN 9/16 EMA ALERT**",
 
-        f"**{len(results)} coins "
-        f"meet ALL 3 conditions**",
+        f"**{len(results)} setup(s)**",
 
         ""
     ]
 
     for result in results:
 
-        crossed = []
+        if (
+            result["direction"]
+            == "BULLISH"
+        ):
 
-        if result[
-            "crossed_vwap"
-        ]:
+            icon = "🟢"
 
-            crossed.append(
-                "VWAP"
+            cross_text = (
+                "9 EMA crossed "
+                "**ABOVE** 16 EMA"
             )
 
-        if result[
-            "crossed_ema"
-        ]:
+        else:
 
-            crossed.append(
-                "1H EMA 200"
+            icon = "🔴"
+
+            cross_text = (
+                "9 EMA crossed "
+                "**BELOW** 16 EMA"
             )
 
         lines += [
 
-            f"🔔 **{result['symbol']}**",
+            f"{icon} **{result['symbol']}**",
+
+            f"📍 Direction: "
+            f"**{result['direction']}**",
 
             f"💰 Price: "
             f"`{result['price']:.8g}`",
 
-            f"📊 Daily VWAP: "
-            f"`{result['vwap']:.8g}`",
+            f"9 EMA: "
+            f"`{result['ema9']:.8g}`",
 
-            f"📈 1H EMA 200: "
-            f"`{result['ema200']:.8g}`",
+            f"16 EMA: "
+            f"`{result['ema16']:.8g}`",
 
             f"🔥 15M Volume: "
             f"`{result['volume_ratio']:.2f}x`",
 
-            "✅ VWAP | "
-            "✅ EMA 200 | "
-            "✅ Volume >2x",
+            f"📈 {cross_text}",
 
-            f"📍 Crossed: "
-            f"**{' + '.join(crossed)}**",
+            f"🕐 Candle closed: "
+            f"`{result['candle_time']}`",
 
             ""
         ]
@@ -765,8 +773,8 @@ def main():
     print("=" * 60)
 
     print(
-        "BLOFIN VWAP + EMA200 + "
-        "VOLUME SCANNER"
+        "BLOFIN 15M 9 EMA x 16 EMA "
+        "+ VOLUME SCANNER"
     )
 
     print("=" * 60)
@@ -777,6 +785,10 @@ def main():
             "DISCORD_WEBHOOK_URL "
             "is missing."
         )
+
+    # --------------------------------------------------------
+    # GET SYMBOLS
+    # --------------------------------------------------------
 
     print(
         "Getting BloFin USDT "
@@ -795,7 +807,7 @@ def main():
     completed_count = 0
 
     # --------------------------------------------------------
-    # PARALLEL SCANNING
+    # SCAN
     # --------------------------------------------------------
 
     with ThreadPoolExecutor(
@@ -810,6 +822,7 @@ def main():
             ): symbol
 
             for symbol in symbols
+
         }
 
         for future in as_completed(
@@ -828,9 +841,16 @@ def main():
 
                 if result:
 
-                    results.append(
+                    # Only recent closed
+                    # candle signals.
+
+                    if is_recent_closed_candle(
                         result
-                    )
+                    ):
+
+                        results.append(
+                            result
+                        )
 
             except Exception as e:
 
@@ -853,18 +873,38 @@ def main():
                 )
 
     # --------------------------------------------------------
-    # SORT
+    # REMOVE DUPLICATES
     # --------------------------------------------------------
+
+    unique = {}
+
+    for result in results:
+
+        key = (
+            result["symbol"],
+            result["candle_timestamp"],
+            result["direction"]
+        )
+
+        unique[key] = result
+
+    results = list(
+        unique.values()
+    )
 
     results.sort(
         key=lambda x:
             x["symbol"]
     )
 
+    # --------------------------------------------------------
+    # RESULTS
+    # --------------------------------------------------------
+
     print()
 
     print(
-        f"Setups found: "
+        f"EMA setups found: "
         f"{len(results)}"
     )
 
@@ -883,14 +923,15 @@ def main():
             print(
                 f"ALERT: "
                 f"{result['symbol']} | "
+                f"{result['direction']} | "
                 f"{result['volume_ratio']:.2f}x"
             )
 
     else:
 
         print(
-            "No coins currently "
-            "meet all conditions."
+            "No recent 9/16 EMA "
+            "crossovers with >2x volume."
         )
 
     # --------------------------------------------------------
@@ -913,7 +954,7 @@ def main():
 
 
 # ============================================================
-# RUN
+# START
 # ============================================================
 
 if __name__ == "__main__":
