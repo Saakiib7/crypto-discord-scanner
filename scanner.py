@@ -1,9 +1,7 @@
 import os
 import time
-import threading
 import requests
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ============================================================
@@ -12,9 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BLOFIN_BASE = "https://openapi.blofin.com"
 
-DISCORD_WEBHOOK = os.environ.get(
-    "DISCORD_WEBHOOK_URL"
-)
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 
 FAST_EMA = 9
 SLOW_EMA = 16
@@ -22,289 +18,239 @@ SLOW_EMA = 16
 VOLUME_LOOKBACK = 20
 VOLUME_MULTIPLIER = 2.0
 
-MAX_WORKERS = 15
+# Conservative rate to avoid BloFin 429 errors
+MAX_REQUESTS_PER_MINUTE = 150
+REQUEST_INTERVAL = 60.0 / MAX_REQUESTS_PER_MINUTE
 
-# BloFin public REST rate limit
-# Stay safely below 500 requests/minute.
-MAX_REQUESTS_PER_MINUTE = 450
+# Number of candles requested for EMA calculation
+CANDLE_LIMIT = 100
 
-REQUEST_INTERVAL = (
-    60.0 / MAX_REQUESTS_PER_MINUTE
-)
+# Only accept signals from a recently closed 15m candle
+MAX_SIGNAL_AGE_MINUTES = 20
 
-
-# ============================================================
-# RATE LIMITER
-# ============================================================
-
-_last_request_time = 0.0
-
-_rate_lock = threading.Lock()
-
-
-def throttle():
-
-    global _last_request_time
-
-    with _rate_lock:
-
-        now = time.monotonic()
-
-        wait = (
-            REQUEST_INTERVAL
-            - (now - _last_request_time)
-        )
-
-        if wait > 0:
-
-            time.sleep(wait)
-
-        _last_request_time = (
-            time.monotonic()
-        )
+# Discord message limit safety
+DISCORD_MAX_LENGTH = 1900
 
 
 # ============================================================
-# THREAD LOCAL SESSION
+# HTTP SESSION + RATE LIMITER
 # ============================================================
 
-_thread_local = threading.local()
+session = requests.Session()
+
+last_request_time = 0.0
 
 
-def get_session():
+def wait_for_rate_limit():
+    global last_request_time
 
-    if not hasattr(
-        _thread_local,
-        "session"
-    ):
+    now = time.monotonic()
+    elapsed = now - last_request_time
 
-        session = requests.Session()
+    if elapsed < REQUEST_INTERVAL:
+        time.sleep(REQUEST_INTERVAL - elapsed)
 
-        session.headers.update({
-            "User-Agent":
-                "Crypto-Discord-EMA-Scanner/5.0"
-        })
-
-        _thread_local.session = session
-
-    return _thread_local.session
+    last_request_time = time.monotonic()
 
 
-# ============================================================
-# BLOFIN API REQUEST
-# ============================================================
+def get_json(path, params=None, retries=2):
 
-def get_json(
-    path,
-    params=None,
-    retries=4
-):
+    url = BLOFIN_BASE + path
 
-    url = (
-        f"{BLOFIN_BASE}{path}"
-    )
+    for attempt in range(retries + 1):
 
-    for attempt in range(retries):
+        wait_for_rate_limit()
 
         try:
-
-            throttle()
-
-            response = get_session().get(
+            response = session.get(
                 url,
                 params=params,
                 timeout=15
             )
 
+            if response.status_code == 200:
+                data = response.json()
+
+                if str(data.get("code", "0")) != "0":
+                    print(
+                        f"BloFin API error: "
+                        f"{data.get('msg', 'Unknown error')}"
+                    )
+                    return None
+
+                return data
+
+            # Rate limit
             if response.status_code == 429:
 
-                print(
-                    "BloFin rate limit. "
-                    "Waiting 10 seconds..."
-                )
+                if attempt < retries:
+                    print(
+                        "BloFin rate limit received. "
+                        "Waiting 30 seconds..."
+                    )
+                    time.sleep(30)
+                    continue
 
-                time.sleep(10)
+                print("BloFin rate limit. Skipping request.")
+                return None
 
-                continue
+            # Temporary server error
+            if response.status_code >= 500:
 
-            if response.status_code == 403:
+                if attempt < retries:
+                    print(
+                        f"BloFin server error {response.status_code}. "
+                        "Waiting 10 seconds..."
+                    )
+                    time.sleep(10)
+                    continue
 
-                print(
-                    "BloFin HTTP 403. "
-                    "Waiting 15 seconds..."
-                )
-
-                time.sleep(15)
-
-                continue
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            if str(
-                data.get("code")
-            ) != "0":
-
-                raise RuntimeError(
-                    f"BloFin API error "
-                    f"{data.get('code')}: "
-                    f"{data.get('msg')}"
-                )
-
-            return data
-
-        except Exception as e:
-
-            if (
-                attempt
-                == retries - 1
-            ):
-
-                raise
+                return None
 
             print(
-                f"Request error: {e}. "
-                f"Retrying..."
+                f"BloFin HTTP error: "
+                f"{response.status_code}"
             )
 
-            time.sleep(
-                2 * (attempt + 1)
-            )
+            return None
+
+        except requests.RequestException as e:
+
+            if attempt < retries:
+                print(
+                    f"Request error: {e}. "
+                    "Retrying in 5 seconds..."
+                )
+                time.sleep(5)
+                continue
+
+            print(f"Request failed: {e}")
+            return None
 
     return None
 
 
 # ============================================================
-# GET LIVE USDT PERPETUALS
+# GET LIVE BLOFIN USDT PERPETUALS
 # ============================================================
 
 def get_symbols():
 
     data = get_json(
-        "/api/v1/market/instruments"
+        "/api/v1/market/instruments",
+        {
+            "instType": "SWAP"
+        }
     )
+
+    if not data:
+        return []
+
+    instruments = data.get("data", [])
 
     symbols = []
 
-    for item in data["data"]:
+    for item in instruments:
 
-        if (
-            item.get("state")
-            == "live"
+        if not isinstance(item, dict):
+            continue
 
-            and item.get("instType")
-            == "SWAP"
+        if item.get("state") != "live":
+            continue
 
-            and item.get("contractType")
-            == "linear"
+        if item.get("instType") != "SWAP":
+            continue
 
-            and item.get("settleCurrency")
-            == "USDT"
-        ):
+        if item.get("contractType") != "linear":
+            continue
 
-            inst_id = item.get(
-                "instId"
-            )
+        if item.get("settleCurrency") != "USDT":
+            continue
 
-            if inst_id:
+        inst_id = item.get("instId")
 
-                symbols.append(
-                    inst_id
-                )
+        if inst_id:
+            symbols.append(inst_id)
 
-    return sorted(
-        set(symbols)
-    )
+    symbols = sorted(set(symbols))
+
+    return symbols
 
 
 # ============================================================
 # GET 15M CANDLES
 # ============================================================
 
-def get_candles(
-    symbol,
-    limit=100
-):
+def get_candles(symbol):
 
     data = get_json(
         "/api/v1/market/candles",
         {
             "instId": symbol,
             "bar": "15m",
-            "limit": str(limit)
+            "limit": CANDLE_LIMIT
         }
     )
 
-    candles = data["data"]
+    if not data:
+        return []
 
-    # BloFin returns newest first.
-    # Convert to oldest -> newest.
-    candles = list(
-        reversed(candles)
-    )
+    candles = data.get("data", [])
+
+    if not candles:
+        return []
+
+    # BloFin returns newest candle first.
+    # Reverse so oldest -> newest.
+    candles = list(reversed(candles))
 
     return candles
 
 
 # ============================================================
-# EMA
+# EMA CALCULATION
 # ============================================================
 
-def calculate_ema(
-    values,
-    period
-):
+def calculate_ema(values, period):
 
     if len(values) < period:
+        return []
 
-        return None
+    multiplier = 2.0 / (period + 1)
 
-    multiplier = (
-        2.0 / (period + 1)
-    )
+    ema = []
 
     # Initial SMA
-    ema = (
-        sum(values[:period])
-        / period
-    )
+    initial_sma = sum(values[:period]) / period
 
-    for price in values[period:]:
+    ema.append(initial_sma)
 
-        ema = (
-            (price - ema)
-            * multiplier
-            + ema
+    previous = initial_sma
+
+    for value in values[period:]:
+
+        current = (
+            (value - previous) * multiplier
+            + previous
         )
+
+        ema.append(current)
+
+        previous = current
 
     return ema
 
 
 # ============================================================
-# CHECK WHETHER CANDLE IS COMPLETED
+# CHECK IF CANDLE IS COMPLETED
 # ============================================================
 
 def is_completed(candle):
 
-    # BloFin candle structure:
-    #
-    # 0 = timestamp
-    # 1 = open
-    # 2 = high
-    # 3 = low
-    # 4 = close
-    # 5 = volume
-    # 6 = base volume
-    # 7 = quote volume
-    # 8 = confirm
-    #
-    # confirm = 1 means completed.
+    if len(candle) < 9:
+        return False
 
-    return (
-        len(candle) >= 9
-        and str(candle[8]) == "1"
-    )
+    return str(candle[8]) == "1"
 
 
 # ============================================================
@@ -313,453 +259,330 @@ def is_completed(candle):
 
 def check_symbol(symbol):
 
+    candles = get_candles(symbol)
+
+    if len(candles) < 30:
+        return None
+
+    # Only completed candles
+    completed = [
+        candle
+        for candle in candles
+        if is_completed(candle)
+    ]
+
+    if len(completed) < 25:
+        return None
+
+    # Latest completed candle
+    current = completed[-1]
+
+    # Candle before it
+    previous = completed[-2]
+
     try:
 
-        candles = get_candles(
-            symbol,
-            100
-        )
-
-        if len(candles) < 30:
-
-            return None
-
-        # ----------------------------------------------------
-        # USE ONLY COMPLETED 15M CANDLES
-        # ----------------------------------------------------
-
-        completed = [
-
-            candle
-
-            for candle
-            in candles
-
-            if is_completed(candle)
-
-        ]
-
-        if len(completed) < 25:
-
-            return None
-
-        # ----------------------------------------------------
-        # LATEST CLOSED CANDLE
-        # ----------------------------------------------------
-
-        current = completed[-1]
-
-        previous = completed[-2]
-
-        current_close = float(
-            current[4]
-        )
-
-        previous_close = float(
-            previous[4]
-        )
-
-        # ----------------------------------------------------
-        # 9 EMA
-        # ----------------------------------------------------
-
         closes = [
-
             float(candle[4])
-
-            for candle
-            in completed
-
+            for candle in completed
         ]
 
-        ema9 = calculate_ema(
-            closes,
-            FAST_EMA
-        )
-
-        ema16 = calculate_ema(
-            closes,
-            SLOW_EMA
-        )
-
-        previous_closes = closes[:-1]
-
-        previous_ema9 = calculate_ema(
-            previous_closes,
-            FAST_EMA
-        )
-
-        previous_ema16 = calculate_ema(
-            previous_closes,
-            SLOW_EMA
-        )
-
-        if (
-            ema9 is None
-            or ema16 is None
-            or previous_ema9 is None
-            or previous_ema16 is None
-        ):
-
-            return None
-
-        # ----------------------------------------------------
-        # CROSSOVER
-        # ----------------------------------------------------
-
-        bullish_cross = (
-
-            previous_ema9
-            <= previous_ema16
-
-            and
-
-            ema9
-            > ema16
-
-        )
-
-        bearish_cross = (
-
-            previous_ema9
-            >= previous_ema16
-
-            and
-
-            ema9
-            < ema16
-
-        )
-
-        if not (
-            bullish_cross
-            or bearish_cross
-        ):
-
-            return None
-
-        # ----------------------------------------------------
-        # VOLUME
-        # ----------------------------------------------------
-
-        # Previous 20 completed candles.
-        # Do NOT include the signal candle.
-
-        volume_candles = completed[
-            -21:-1
-        ]
-
-        if len(
-            volume_candles
-        ) != VOLUME_LOOKBACK:
-
-            return None
+        current_volume = float(current[5])
 
         previous_volumes = [
-
             float(candle[5])
-
-            for candle
-            in volume_candles
-
+            for candle in completed[-21:-1]
         ]
 
-        current_volume = float(
-            current[5]
-        )
-
-        average_volume = (
-            sum(previous_volumes)
-            / VOLUME_LOOKBACK
-        )
-
-        if average_volume <= 0:
-
+        if len(previous_volumes) != 20:
             return None
 
-        volume_ratio = (
-            current_volume
-            / average_volume
-        )
-
-        # Must be STRICTLY greater than 2x.
-        if (
-            volume_ratio
-            <= VOLUME_MULTIPLIER
-        ):
-
-            return None
-
-        # ----------------------------------------------------
-        # CANDLE TIME
-        # ----------------------------------------------------
-
-        candle_timestamp = int(
-            current[0]
-        )
-
-        candle_time = (
-            datetime.fromtimestamp(
-                candle_timestamp / 1000,
-                timezone.utc
-            )
-        )
-
-        return {
-
-            "symbol":
-                symbol,
-
-            "direction":
-                (
-                    "BULLISH"
-                    if bullish_cross
-                    else "BEARISH"
-                ),
-
-            "price":
-                current_close,
-
-            "ema9":
-                ema9,
-
-            "ema16":
-                ema16,
-
-            "volume_ratio":
-                volume_ratio,
-
-            "candle_time":
-                candle_time.strftime(
-                    "%Y-%m-%d %H:%M UTC"
-                ),
-
-            "candle_timestamp":
-                candle_timestamp
-
-        }
-
-    except Exception as e:
-
-        print(
-            f"Error checking "
-            f"{symbol}: {e}"
-        )
+    except (ValueError, TypeError, IndexError):
 
         return None
 
+    # --------------------------------------------------------
+    # EMA CURRENT
+    # --------------------------------------------------------
 
-# ============================================================
-# CHECK WHETHER SIGNAL CANDLE IS RECENT
-# ============================================================
-
-def is_recent_closed_candle(
-    result
-):
-
-    candle_timestamp = (
-        result["candle_timestamp"]
+    ema9_series = calculate_ema(
+        closes,
+        FAST_EMA
     )
 
-    now = time.time()
-
-    age = (
-        now
-        - candle_timestamp / 1000
+    ema16_series = calculate_ema(
+        closes,
+        SLOW_EMA
     )
 
-    # Only alert for a recently closed candle.
-    #
-    # This prevents the same crossover from
-    # triggering again on the next 5-minute scan.
-    #
-    # Maximum 9 minutes old.
+    if not ema9_series or not ema16_series:
+        return None
 
-    return (
-        0
-        <= age
-        < 9 * 60
+    current_ema9 = ema9_series[-1]
+    current_ema16 = ema16_series[-1]
+
+    # --------------------------------------------------------
+    # EMA PREVIOUS
+    # --------------------------------------------------------
+
+    previous_closes = closes[:-1]
+
+    previous_ema9_series = calculate_ema(
+        previous_closes,
+        FAST_EMA
     )
 
+    previous_ema16_series = calculate_ema(
+        previous_closes,
+        SLOW_EMA
+    )
+
+    if not previous_ema9_series or not previous_ema16_series:
+        return None
+
+    previous_ema9 = previous_ema9_series[-1]
+    previous_ema16 = previous_ema16_series[-1]
+
+    # --------------------------------------------------------
+    # CROSSOVER
+    # --------------------------------------------------------
+
+    bullish_cross = (
+        previous_ema9 <= previous_ema16
+        and current_ema9 > current_ema16
+    )
+
+    bearish_cross = (
+        previous_ema9 >= previous_ema16
+        and current_ema9 < current_ema16
+    )
+
+    if not bullish_cross and not bearish_cross:
+        return None
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    average_volume = (
+        sum(previous_volumes)
+        / len(previous_volumes)
+    )
+
+    if average_volume <= 0:
+        return None
+
+    volume_ratio = (
+        current_volume
+        / average_volume
+    )
+
+    if volume_ratio <= VOLUME_MULTIPLIER:
+        return None
+
+    # --------------------------------------------------------
+    # CANDLE TIME
+    # --------------------------------------------------------
+
+    try:
+        candle_timestamp = int(current[0])
+    except (ValueError, TypeError, IndexError):
+        return None
+
+    # BloFin timestamp is milliseconds
+    candle_close_timestamp = (
+        candle_timestamp
+        + (15 * 60 * 1000)
+    )
+
+    now_timestamp = int(
+        datetime.now(timezone.utc).timestamp()
+        * 1000
+    )
+
+    age_minutes = (
+        now_timestamp
+        - candle_close_timestamp
+    ) / 60000
+
+    # Candle must already be closed
+    if age_minutes < 0:
+        return None
+
+    # Ignore very old signals
+    if age_minutes > MAX_SIGNAL_AGE_MINUTES:
+        return None
+
+    direction = (
+        "BULLISH"
+        if bullish_cross
+        else "BEARISH"
+    )
+
+    price = float(current[4])
+
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "price": price,
+        "ema9": current_ema9,
+        "ema16": current_ema16,
+        "volume_ratio": volume_ratio,
+        "candle_timestamp": candle_timestamp,
+        "age_minutes": age_minutes
+    }
+
 
 # ============================================================
-# DISCORD MESSAGE SPLITTER
+# DISCORD
 # ============================================================
 
-def split_message(
-    message,
-    max_len=1900
-):
-
-    chunks = []
-
-    while len(message) > max_len:
-
-        split_at = message.rfind(
-            "\n\n",
-            0,
-            max_len
-        )
-
-        if split_at == -1:
-
-            split_at = message.rfind(
-                "\n",
-                0,
-                max_len
-            )
-
-        if split_at == -1:
-
-            split_at = max_len
-
-        chunks.append(
-            message[:split_at]
-        )
-
-        message = (
-            message[split_at:]
-            .lstrip()
-        )
-
-    if message:
-
-        chunks.append(
-            message
-        )
-
-    return chunks
-
-
-# ============================================================
-# SEND DISCORD ALERT
-# ============================================================
-
-def send_discord_alert(
-    results
-):
+def send_discord_message(message):
 
     if not DISCORD_WEBHOOK:
+        print("ERROR: DISCORD_WEBHOOK_URL is missing.")
+        return False
 
-        raise RuntimeError(
-            "DISCORD_WEBHOOK_URL "
-            "is missing."
+    try:
+
+        response = session.post(
+            DISCORD_WEBHOOK,
+            json={
+                "content": message,
+                "allowed_mentions": {
+                    "parse": []
+                }
+            },
+            timeout=15
         )
 
-    lines = [
+        if response.status_code in (200, 204):
+            return True
 
-        "⚡ **BLOFIN 9/16 EMA ALERT**",
-
-        f"**{len(results)} setup(s)**",
-
-        ""
-    ]
-
-    for result in results:
-
-        if (
-            result["direction"]
-            == "BULLISH"
-        ):
-
-            icon = "🟢"
-
-            cross_text = (
-                "9 EMA crossed "
-                "**ABOVE** 16 EMA"
-            )
-
-        else:
-
-            icon = "🔴"
-
-            cross_text = (
-                "9 EMA crossed "
-                "**BELOW** 16 EMA"
-            )
-
-        lines += [
-
-            f"{icon} **{result['symbol']}**",
-
-            f"📍 Direction: "
-            f"**{result['direction']}**",
-
-            f"💰 Price: "
-            f"`{result['price']:.8g}`",
-
-            f"9 EMA: "
-            f"`{result['ema9']:.8g}`",
-
-            f"16 EMA: "
-            f"`{result['ema16']:.8g}`",
-
-            f"🔥 15M Volume: "
-            f"`{result['volume_ratio']:.2f}x`",
-
-            f"📈 {cross_text}",
-
-            f"🕐 Candle closed: "
-            f"`{result['candle_time']}`",
-
-            ""
-        ]
-
-    message = "\n".join(
-        lines
-    )
-
-    chunks = split_message(
-        message
-    )
-
-    for chunk in chunks:
-
-        for attempt in range(4):
-
-            response = (
-                get_session().post(
-                    DISCORD_WEBHOOK,
-                    json={
-                        "content": chunk
-                    },
-                    timeout=15
-                )
-            )
-
-            if (
-                response.status_code
-                != 429
-            ):
-
-                response.raise_for_status()
-
-                break
+        if response.status_code == 429:
 
             try:
-
-                retry_after = float(
-                    response.json().get(
-                        "retry_after",
-                        2
-                    )
+                retry_after = response.json().get(
+                    "retry_after",
+                    2
                 )
-
             except Exception:
-
                 retry_after = 2
 
             print(
-                "Discord rate limit. "
-                f"Waiting "
-                f"{retry_after:.2f}s..."
+                f"Discord rate limit. "
+                f"Waiting {retry_after} seconds..."
             )
 
-            time.sleep(
-                retry_after + 1
+            time.sleep(float(retry_after))
+
+            response = session.post(
+                DISCORD_WEBHOOK,
+                json={
+                    "content": message,
+                    "allowed_mentions": {
+                        "parse": []
+                    }
+                },
+                timeout=15
             )
 
-        time.sleep(0.75)
+            return response.status_code in (200, 204)
+
+        print(
+            f"Discord error: "
+            f"{response.status_code}"
+        )
+
+        return False
+
+    except requests.RequestException as e:
+
+        print(f"Discord request failed: {e}")
+
+        return False
+
+
+def send_alerts(results):
+
+    if not results:
+        return
+
+    results = sorted(
+        results,
+        key=lambda x: (
+            x["direction"],
+            -x["volume_ratio"]
+        )
+    )
+
+    header = (
+        "⚡ **BLOFIN 15M EMA 9/16 ALERT**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    messages = []
+    current_message = header
+
+    for result in results:
+
+        emoji = (
+            "🟢"
+            if result["direction"] == "BULLISH"
+            else "🔴"
+        )
+
+        candle_time = datetime.fromtimestamp(
+            result["candle_timestamp"] / 1000,
+            tz=timezone.utc
+        ).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+
+        block = (
+            f"{emoji} **{result['direction']}** "
+            f"`{result['symbol']}`\n"
+            f"Price: `{result['price']:.8g}`\n"
+            f"EMA 9: `{result['ema9']:.8g}`\n"
+            f"EMA 16: `{result['ema16']:.8g}`\n"
+            f"Volume: **{result['volume_ratio']:.2f}x**\n"
+            f"Candle: `{candle_time}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+        if (
+            len(current_message)
+            + len(block)
+            > DISCORD_MAX_LENGTH
+        ):
+
+            messages.append(current_message)
+            current_message = block
+
+        else:
+
+            current_message += block
+
+    if current_message.strip():
+        messages.append(current_message)
+
+    for index, message in enumerate(messages):
+
+        success = send_discord_message(message)
+
+        if success:
+            print(
+                f"Discord alert sent "
+                f"({index + 1}/{len(messages)})"
+            )
+        else:
+            print(
+                f"Failed to send Discord alert "
+                f"({index + 1}/{len(messages)})"
+            )
+
+        if index < len(messages) - 1:
+            time.sleep(1)
 
 
 # ============================================================
@@ -771,192 +594,112 @@ def main():
     start_time = time.time()
 
     print("=" * 60)
-
-    print(
-        "BLOFIN 15M 9 EMA x 16 EMA "
-        "+ VOLUME SCANNER"
-    )
-
+    print("BLOFIN 15M EMA 9/16 SCANNER")
     print("=" * 60)
 
-    if not DISCORD_WEBHOOK:
+    print(
+        "Strategy: 15M EMA 9/16 crossover + "
+        ">2x volume"
+    )
 
-        raise RuntimeError(
-            "DISCORD_WEBHOOK_URL "
-            "is missing."
-        )
+    print(
+        "Only completed 15M candles are used."
+    )
+
+    print(
+        f"API rate: {MAX_REQUESTS_PER_MINUTE} "
+        "requests/minute"
+    )
+
+    print()
 
     # --------------------------------------------------------
     # GET SYMBOLS
     # --------------------------------------------------------
 
-    print(
-        "Getting BloFin USDT "
-        "perpetual symbols..."
-    )
-
     symbols = get_symbols()
 
+    if not symbols:
+
+        print("No live BloFin USDT perpetuals found.")
+        return
+
     print(
-        f"Found {len(symbols)} "
-        "USDT perpetual symbols."
+        f"Found {len(symbols)} live USDT perpetuals."
     )
 
-    results = []
-
-    completed_count = 0
+    print("Starting scan...")
+    print()
 
     # --------------------------------------------------------
     # SCAN
     # --------------------------------------------------------
 
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
+    results = []
 
-        futures = {
+    total = len(symbols)
 
-            executor.submit(
-                check_symbol,
-                symbol
-            ): symbol
+    for index, symbol in enumerate(symbols, start=1):
 
-            for symbol in symbols
+        result = check_symbol(symbol)
 
-        }
+        if result:
+            results.append(result)
 
-        for future in as_completed(
-            futures
-        ):
+            print(
+                f"🚨 SIGNAL: "
+                f"{result['direction']} "
+                f"{symbol} "
+                f"{result['volume_ratio']:.2f}x"
+            )
 
-            symbol = futures[
-                future
-            ]
+        if index % 50 == 0 or index == total:
 
-            try:
+            elapsed = time.time() - start_time
 
-                result = (
-                    future.result()
-                )
-
-                if result:
-
-                    # Only recent closed
-                    # candle signals.
-
-                    if is_recent_closed_candle(
-                        result
-                    ):
-
-                        results.append(
-                            result
-                        )
-
-            except Exception as e:
-
-                print(
-                    f"Worker error "
-                    f"{symbol}: {e}"
-                )
-
-            completed_count += 1
-
-            if (
-                completed_count % 50
-                == 0
-            ):
-
-                print(
-                    f"Progress: "
-                    f"{completed_count}/"
-                    f"{len(symbols)}"
-                )
-
-    # --------------------------------------------------------
-    # REMOVE DUPLICATES
-    # --------------------------------------------------------
-
-    unique = {}
-
-    for result in results:
-
-        key = (
-            result["symbol"],
-            result["candle_timestamp"],
-            result["direction"]
-        )
-
-        unique[key] = result
-
-    results = list(
-        unique.values()
-    )
-
-    results.sort(
-        key=lambda x:
-            x["symbol"]
-    )
+            print(
+                f"Progress: {index}/{total} "
+                f"({index / total * 100:.1f}%) "
+                f"- {elapsed:.1f}s"
+            )
 
     # --------------------------------------------------------
     # RESULTS
     # --------------------------------------------------------
 
     print()
-
     print(
-        f"EMA setups found: "
-        f"{len(results)}"
+        f"EMA setups found: {len(results)}"
     )
 
-    # --------------------------------------------------------
-    # DISCORD
-    # --------------------------------------------------------
-
     if results:
-
-        send_discord_alert(
-            results
-        )
 
         for result in results:
 
             print(
-                f"ALERT: "
                 f"{result['symbol']} | "
                 f"{result['direction']} | "
-                f"{result['volume_ratio']:.2f}x"
+                f"Volume {result['volume_ratio']:.2f}x"
             )
+
+        send_alerts(results)
 
     else:
 
         print(
-            "No recent 9/16 EMA "
-            "crossovers with >2x volume."
+            "No recent 9/16 EMA crossovers "
+            "with >2x volume."
         )
 
-    # --------------------------------------------------------
-    # TIME
-    # --------------------------------------------------------
-
-    elapsed = (
-        time.time()
-        - start_time
-    )
+    elapsed = time.time() - start_time
 
     print()
-
     print(
-        f"Total scan time: "
-        f"{elapsed:.1f} seconds"
+        f"Total scan time: {elapsed:.1f} seconds"
     )
 
     print("=" * 60)
 
 
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
-
     main()
