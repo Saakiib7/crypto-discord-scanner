@@ -389,7 +389,8 @@ def check_symbol(symbol):
     except (ValueError, TypeError, IndexError):
         return None
 
-    # BloFin timestamp is milliseconds
+    # BloFin timestamp is milliseconds.
+    # candle_timestamp = candle OPEN time.
     candle_close_timestamp = (
         candle_timestamp
         + (15 * 60 * 1000)
@@ -400,6 +401,7 @@ def check_symbol(symbol):
         * 1000
     )
 
+    # Age measured from the actual candle CLOSE time
     age_minutes = (
         now_timestamp
         - candle_close_timestamp
@@ -429,6 +431,7 @@ def check_symbol(symbol):
         "ema16": current_ema16,
         "volume_ratio": volume_ratio,
         "candle_timestamp": candle_timestamp,
+        "candle_close_timestamp": candle_close_timestamp,
         "age_minutes": age_minutes
     }
 
@@ -532,8 +535,17 @@ def send_alerts(results):
             else "🔴"
         )
 
-        candle_time = datetime.fromtimestamp(
+        # Candle OPEN time
+        candle_open_time = datetime.fromtimestamp(
             result["candle_timestamp"] / 1000,
+            tz=timezone.utc
+        ).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+
+        # Candle CLOSE time
+        candle_close_time = datetime.fromtimestamp(
+            result["candle_close_timestamp"] / 1000,
             tz=timezone.utc
         ).strftime(
             "%Y-%m-%d %H:%M UTC"
@@ -546,7 +558,9 @@ def send_alerts(results):
             f"EMA 9: `{result['ema9']:.8g}`\n"
             f"EMA 16: `{result['ema16']:.8g}`\n"
             f"Volume: **{result['volume_ratio']:.2f}x**\n"
-            f"Candle: `{candle_time}`\n"
+            f"Candle: `{candle_open_time} → "
+            f"{candle_close_time}`\n"
+            f"✅ Closed: `{candle_close_time}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
         )
 
