@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import math
 import threading
 from datetime import datetime, timezone
 
@@ -10,44 +9,43 @@ import websocket
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 BLOFIN_REST = "https://openapi.blofin.com"
 BLOFIN_WS = "wss://openapi.blofin.com/ws/public"
 
-DISCORD_WEBHOOK_URL = os.getenv("ORDERBLOCK_DISCORD_WEBHOOK_URL")
+DISCORD_WEBHOOK_URL = os.getenv(
+    "ORDERBLOCK_DISCORD_WEBHOOK_URL"
+)
 
 TIMEFRAME = "15m"
 
-# Fixed approach distance requested by user
+# User requested fixed 1% approach distance
 APPROACH_PERCENT = 1.0
 
-# Number of historical candles used to find fresh OBs
 HISTORY_CANDLES = 120
 
-# Number of candles used to determine recent structure
 STRUCTURE_LOOKBACK = 10
 
-# Minimum displacement size.
-# The displacement candle must be meaningfully larger
-# than the recent average candle body.
+# Strong displacement requirement
 DISPLACEMENT_MULTIPLIER = 1.5
 
-# Maximum age of an OB before we stop considering it fresh.
-# 20 candles = 5 hours on 15m timeframe.
+# OB remains fresh for maximum 20 candles = 5 hours
 MAX_OB_AGE_CANDLES = 20
 
-# Prevent repeated alerts for the same OB.
+# Keep memory under control
+MAX_ACTIVE_OBS_PER_SYMBOL = 10
+
+
+# ============================================================
+# GLOBAL DATA
+# ============================================================
+
+candle_history = {}
+active_obs = {}
 alerted_obs = set()
 
-# symbol -> list of completed candles
-candle_history = {}
-
-# symbol -> list of active order blocks
-active_obs = {}
-
-# Protect shared data between WebSocket threads
 data_lock = threading.Lock()
 
 
@@ -56,7 +54,9 @@ data_lock = threading.Lock()
 # ============================================================
 
 def log(message):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
     print(f"[{now}] {message}", flush=True)
 
 
@@ -65,404 +65,542 @@ def log(message):
 # ============================================================
 
 def send_discord(message):
+
     if not DISCORD_WEBHOOK_URL:
-        log("ERROR: ORDERBLOCK_DISCORD_WEBHOOK_URL is missing.")
+        log(
+            "ERROR: "
+            "ORDERBLOCK_DISCORD_WEBHOOK_URL "
+            "is missing."
+        )
         return False
 
     try:
+
         response = requests.post(
             DISCORD_WEBHOOK_URL,
-            json={"content": message},
-            timeout=10,
+            json={
+                "content": message
+            },
+            timeout=10
         )
 
         if response.status_code in (200, 204):
             return True
 
         if response.status_code == 429:
-            log("Discord rate limit reached.")
+
+            log(
+                "Discord rate limit reached."
+            )
+
             time.sleep(2)
+
             return False
 
         log(
-            f"Discord error: HTTP {response.status_code} "
+            f"Discord HTTP "
+            f"{response.status_code}: "
             f"{response.text[:300]}"
         )
+
         return False
 
     except Exception as e:
-        log(f"Discord exception: {e}")
+
+        log(
+            f"Discord exception: {e}"
+        )
+
         return False
 
 
 # ============================================================
-# BLOFIN REST
+# BLOFIN REST — SYMBOLS
 # ============================================================
 
 def get_symbols():
-    url = f"{BLOFIN_REST}/api/v1/market/instruments"
 
-    params = {
-        "instType": "SWAP"
-    }
+    url = (
+        f"{BLOFIN_REST}"
+        f"/api/v1/market/instruments"
+    )
 
     response = requests.get(
         url,
-        params=params,
-        timeout=15,
+        params={
+            "instType": "SWAP"
+        },
+        timeout=20
     )
 
     response.raise_for_status()
 
-    data = response.json()
+    payload = response.json()
 
     symbols = []
 
-    for item in data.get("data", []):
-        inst_id = item.get("instId", "")
+    for item in payload.get("data", []):
+
+        inst_id = item.get(
+            "instId",
+            ""
+        )
+
+        state = item.get(
+            "state",
+            "live"
+        )
 
         if (
             inst_id.endswith("-USDT")
-            and item.get("state", "live") == "live"
+            and state == "live"
         ):
             symbols.append(inst_id)
 
-    symbols = sorted(set(symbols))
+    symbols = sorted(
+        set(symbols)
+    )
 
-    log(f"Found {len(symbols)} live USDT perpetuals.")
+    log(
+        f"Found {len(symbols)} "
+        f"live USDT perpetuals."
+    )
 
     return symbols
 
 
-def get_history(symbol):
-    url = f"{BLOFIN_REST}/api/v1/market/candles"
+# ============================================================
+# BLOFIN REST — HISTORICAL CANDLES
+# ============================================================
 
-    params = {
-        "instId": symbol,
-        "bar": TIMEFRAME,
-        "limit": HISTORY_CANDLES,
-    }
+def get_history(symbol):
+
+    url = (
+        f"{BLOFIN_REST}"
+        f"/api/v1/market/candles"
+    )
 
     response = requests.get(
         url,
-        params=params,
-        timeout=15,
+        params={
+            "instId": symbol,
+            "bar": TIMEFRAME,
+            "limit": HISTORY_CANDLES
+        },
+        timeout=20
     )
 
     response.raise_for_status()
 
-    data = response.json()
+    payload = response.json()
 
     candles = []
 
-    for row in data.get("data", []):
+    for row in payload.get("data", []):
+
         try:
-            ts = int(row[0])
-            open_price = float(row[1])
-            high = float(row[2])
-            low = float(row[3])
-            close = float(row[4])
-            volume = float(row[5])
 
             candles.append({
-                "ts": ts,
-                "open": open_price,
-                "high": high,
-                "low": low,
-                "close": close,
-                "volume": volume,
+                "ts": int(row[0]),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5])
             })
 
         except Exception:
             continue
 
-    candles.sort(key=lambda x: x["ts"])
+    candles.sort(
+        key=lambda x: x["ts"]
+    )
 
-    # Remove currently forming candle.
-    now_ms = int(time.time() * 1000)
-    current_candle_start = (
-        now_ms // (15 * 60 * 1000)
-    ) * (15 * 60 * 1000)
+    # Remove current unfinished candle.
+    now_ms = int(
+        time.time() * 1000
+    )
+
+    candle_ms = 15 * 60 * 1000
+
+    current_start = (
+        now_ms // candle_ms
+    ) * candle_ms
 
     candles = [
         c for c in candles
-        if c["ts"] < current_candle_start
+        if c["ts"] < current_start
     ]
 
     return candles[-HISTORY_CANDLES:]
 
 
 # ============================================================
-# PRICE FORMATTING
+# FORMATTING
 # ============================================================
 
 def format_price(price):
+
     if price >= 1000:
         return f"{price:,.2f}"
+
     if price >= 1:
         return f"{price:.4f}"
+
     if price >= 0.01:
         return f"{price:.6f}"
+
     return f"{price:.8f}"
 
 
-def format_percent(value):
-    return f"{value:.2f}%"
+def candle_body(candle):
+
+    return abs(
+        candle["close"] -
+        candle["open"]
+    )
 
 
 # ============================================================
 # ORDER BLOCK DETECTION
 # ============================================================
 
-def candle_body(candle):
-    return abs(candle["close"] - candle["open"])
-
-
-def average_body(candles):
-    if not candles:
-        return 0
-
-    return sum(candle_body(c) for c in candles) / len(candles)
-
-
-def detect_order_blocks(symbol, candles):
+def detect_latest_order_block(
+    symbol,
+    candles
+):
     """
-    Detect fresh 15m order blocks.
+    Detect an OB created by the latest
+    completed 15m candle.
 
-    Bullish OB:
-        Last bearish candle before strong bullish displacement
-        that breaks recent structure.
+    Bullish:
+        latest candle is strong bullish
+        displacement and breaks recent high.
 
-    Bearish OB:
-        Last bullish candle before strong bearish displacement
-        that breaks recent structure.
+        OB = last bearish candle before it.
+
+    Bearish:
+        latest candle is strong bearish
+        displacement and breaks recent low.
+
+        OB = last bullish candle before it.
     """
 
-    if len(candles) < STRUCTURE_LOOKBACK + 5:
-        return []
+    if len(candles) < 25:
+        return None
 
-    found = []
+    displacement = candles[-1]
 
-    start = STRUCTURE_LOOKBACK + 2
+    previous = candles[:-1]
 
-    for i in range(start, len(candles)):
-        displacement = candles[i]
+    structure = previous[
+        -STRUCTURE_LOOKBACK:
+    ]
 
-        previous = candles[:i]
+    recent_high = max(
+        c["high"]
+        for c in structure
+    )
 
-        structure_window = previous[-STRUCTURE_LOOKBACK:]
+    recent_low = min(
+        c["low"]
+        for c in structure
+    )
 
-        recent_high = max(c["high"] for c in structure_window)
-        recent_low = min(c["low"] for c in structure_window)
+    avg_body_candles = previous[-20:]
 
-        avg_body = average_body(
-            previous[-20:]
+    avg_body = (
+        sum(
+            candle_body(c)
+            for c in avg_body_candles
         )
+        /
+        len(avg_body_candles)
+    )
 
-        if avg_body <= 0:
-            continue
+    if avg_body <= 0:
+        return None
 
-        displacement_body = candle_body(displacement)
+    displacement_body = candle_body(
+        displacement
+    )
 
-        strong_displacement = (
-            displacement_body >=
-            avg_body * DISPLACEMENT_MULTIPLIER
-        )
+    strong_displacement = (
+        displacement_body
+        >=
+        avg_body *
+        DISPLACEMENT_MULTIPLIER
+    )
 
-        # ----------------------------------------------------
-        # BULLISH DISPLACEMENT
-        # ----------------------------------------------------
+    # ========================================================
+    # BULLISH
+    # ========================================================
 
-        bullish_displacement = (
-            displacement["close"] > displacement["open"]
-            and displacement["close"] > recent_high
-            and strong_displacement
-        )
+    bullish = (
+        displacement["close"]
+        >
+        displacement["open"]
+        and
+        displacement["close"]
+        >
+        recent_high
+        and
+        strong_displacement
+    )
 
-        if bullish_displacement:
-            # Search backwards for the last bearish candle.
-            for j in range(i - 1, max(-1, i - 6), -1):
-                candidate = candles[j]
+    if bullish:
 
-                if candidate["close"] < candidate["open"]:
+        # Find the most recent bearish candle.
+        for candidate in reversed(previous[-6:]):
 
-                    ob = {
-                        "symbol": symbol,
-                        "type": "BULLISH",
-                        "ts": candidate["ts"],
-                        "open": candidate["open"],
-                        "high": candidate["high"],
-                        "low": candidate["low"],
-                        "formation_close": displacement["close"],
-                    }
+            if (
+                candidate["close"]
+                <
+                candidate["open"]
+            ):
 
-                    found.append(ob)
-                    break
+                return {
+                    "symbol": symbol,
+                    "type": "BULLISH",
+                    "ts": candidate["ts"],
+                    "open": candidate["open"],
+                    "high": candidate["high"],
+                    "low": candidate["low"],
+                    "created_ts": displacement["ts"]
+                }
 
-        # ----------------------------------------------------
-        # BEARISH DISPLACEMENT
-        # ----------------------------------------------------
+    # ========================================================
+    # BEARISH
+    # ========================================================
 
-        bearish_displacement = (
-            displacement["close"] < displacement["open"]
-            and displacement["close"] < recent_low
-            and strong_displacement
-        )
+    bearish = (
+        displacement["close"]
+        <
+        displacement["open"]
+        and
+        displacement["close"]
+        <
+        recent_low
+        and
+        strong_displacement
+    )
 
-        if bearish_displacement:
-            # Search backwards for the last bullish candle.
-            for j in range(i - 1, max(-1, i - 6), -1):
-                candidate = candles[j]
+    if bearish:
 
-                if candidate["close"] > candidate["open"]:
+        # Find the most recent bullish candle.
+        for candidate in reversed(previous[-6:]):
 
-                    ob = {
-                        "symbol": symbol,
-                        "type": "BEARISH",
-                        "ts": candidate["ts"],
-                        "open": candidate["open"],
-                        "high": candidate["high"],
-                        "low": candidate["low"],
-                        "formation_close": displacement["close"],
-                    }
+            if (
+                candidate["close"]
+                >
+                candidate["open"]
+            ):
 
-                    found.append(ob)
-                    break
+                return {
+                    "symbol": symbol,
+                    "type": "BEARISH",
+                    "ts": candidate["ts"],
+                    "open": candidate["open"],
+                    "high": candidate["high"],
+                    "low": candidate["low"],
+                    "created_ts": displacement["ts"]
+                }
 
-    # Remove duplicates.
-    unique = {}
-
-    for ob in found:
-        key = (
-            ob["symbol"],
-            ob["type"],
-            ob["ts"],
-        )
-        unique[key] = ob
-
-    return list(unique.values())
+    return None
 
 
 # ============================================================
-# OB VALIDATION
+# OB KEY
 # ============================================================
 
 def ob_key(ob):
+
     return (
         ob["symbol"],
         ob["type"],
-        ob["ts"],
+        ob["ts"]
     )
 
 
-def is_ob_still_fresh(ob, current_price):
-    """
-    Fresh means price has not entered the OB zone.
-    """
+# ============================================================
+# OB ZONE
+# ============================================================
+
+def get_ob_zone(ob):
 
     if ob["type"] == "BULLISH":
 
-        # Bullish zone = low -> open
-        zone_low = ob["low"]
-        zone_high = ob["open"]
-
-    else:
-
-        # Bearish zone = open -> high
-        zone_low = ob["open"]
-        zone_high = ob["high"]
-
-    return not (
-        zone_low <= current_price <= zone_high
-    )
-
-
-def ob_zone(ob):
-    if ob["type"] == "BULLISH":
+        # Bullish OB:
+        # low → open
         return (
-            min(ob["low"], ob["open"]),
-            max(ob["low"], ob["open"]),
+            min(
+                ob["low"],
+                ob["open"]
+            ),
+            max(
+                ob["low"],
+                ob["open"]
+            )
         )
 
+    # Bearish OB:
+    # open → high
     return (
-        min(ob["open"], ob["high"]),
-        max(ob["open"], ob["high"]),
+        min(
+            ob["open"],
+            ob["high"]
+        ),
+        max(
+            ob["open"],
+            ob["high"]
+        )
     )
 
 
 # ============================================================
-# 1% APPROACH DETECTION
+# DISTANCE TO OB
 # ============================================================
 
-def calculate_distance_to_ob(ob, price):
+def distance_to_ob(
+    ob,
+    price
+):
 
-    zone_low, zone_high = ob_zone(ob)
+    zone_low, zone_high = (
+        get_ob_zone(ob)
+    )
 
-    # Price already inside OB
-    if zone_low <= price <= zone_high:
+    # Price is inside OB
+    if (
+        zone_low
+        <=
+        price
+        <=
+        zone_high
+    ):
         return 0.0
 
     # Price above OB
     if price > zone_high:
-        return ((price - zone_high) / zone_high) * 100
+
+        return (
+            (price - zone_high)
+            /
+            zone_high
+            *
+            100
+        )
 
     # Price below OB
-    return ((zone_low - price) / zone_low) * 100
-
-
-def approaching_ob(ob, price):
-
-    distance = calculate_distance_to_ob(
-        ob,
-        price,
+    return (
+        (zone_low - price)
+        /
+        zone_low
+        *
+        100
     )
 
-    return distance <= APPROACH_PERCENT
+
+# ============================================================
+# APPROACH CHECK
+# ============================================================
+
+def is_approaching(
+    ob,
+    price
+):
+
+    return (
+        distance_to_ob(
+            ob,
+            price
+        )
+        <=
+        APPROACH_PERCENT
+    )
 
 
 # ============================================================
-# DISCORD ALERT
+# DISCORD OB ALERT
 # ============================================================
 
-def send_ob_alert(ob, price):
+def send_ob_alert(
+    ob,
+    price
+):
 
     key = ob_key(ob)
 
     if key in alerted_obs:
         return
 
-    zone_low, zone_high = ob_zone(ob)
-
-    distance = calculate_distance_to_ob(
-        ob,
-        price,
+    zone_low, zone_high = (
+        get_ob_zone(ob)
     )
 
-    formation_time = datetime.fromtimestamp(
+    distance = distance_to_ob(
+        ob,
+        price
+    )
+
+    created_time = datetime.fromtimestamp(
+        ob["created_ts"] / 1000,
+        tz=timezone.utc
+    )
+
+    ob_time = datetime.fromtimestamp(
         ob["ts"] / 1000,
-        tz=timezone.utc,
+        tz=timezone.utc
+    )
+
+    direction_emoji = (
+        "🟢"
+        if ob["type"] == "BULLISH"
+        else
+        "🔴"
     )
 
     message = (
         f"🔔 **15M ORDER BLOCK APPROACHING**\n\n"
+
         f"**{ob['symbol']}**\n"
+
+        f"{direction_emoji} "
         f"Direction: **{ob['type']}**\n\n"
-        f"💰 Current Price: `{format_price(price)}`\n"
-        f"🟦 OB Zone: `{format_price(zone_low)}` → "
+
+        f"💰 Current Price: "
+        f"`{format_price(price)}`\n"
+
+        f"🎯 OB Zone: "
+        f"`{format_price(zone_low)}`"
+        f" → "
         f"`{format_price(zone_high)}`\n"
-        f"📏 Distance: **{format_percent(distance)}**\n"
-        f"🎯 Alert Range: **1.00%**\n\n"
-        f"🕐 OB Candle: "
-        f"`{formation_time.strftime('%Y-%m-%d %H:%M UTC')}`\n"
+
+        f"📏 Distance: "
+        f"**{distance:.2f}%**\n"
+
+        f"⚡ Alert threshold: "
+        f"**1.00%**\n\n"
+
+        f"📦 OB Candle: "
+        f"`{ob_time.strftime('%Y-%m-%d %H:%M UTC')}`\n"
+
+        f"🚀 BOS/Displacement: "
+        f"`{created_time.strftime('%Y-%m-%d %H:%M UTC')}`\n"
+
         f"⏱️ Timeframe: **15M**\n"
-        f"🟢 Status: **FRESH / APPROACHING**"
+
+        f"🟡 Status: **FRESH / APPROACHING**"
     )
 
     if send_discord(message):
+
         alerted_obs.add(key)
+
         log(
-            f"ALERT: {ob['symbol']} "
-            f"{ob['type']} OB "
+            f"ALERT SENT: "
+            f"{ob['symbol']} "
+            f"{ob['type']} "
             f"{distance:.2f}% away"
         )
 
@@ -471,14 +609,20 @@ def send_ob_alert(ob, price):
 # PRICE PROCESSING
 # ============================================================
 
-def process_price(symbol, price):
+def process_price(
+    symbol,
+    price
+):
 
     if price <= 0:
         return
 
     with data_lock:
 
-        obs = active_obs.get(symbol, [])
+        obs = active_obs.get(
+            symbol,
+            []
+        )
 
         if not obs:
             return
@@ -487,57 +631,71 @@ def process_price(symbol, price):
 
         for ob in obs:
 
-            key = ob_key(ob)
-
-            zone_low, zone_high = ob_zone(ob)
+            zone_low, zone_high = (
+                get_ob_zone(ob)
+            )
 
             # ------------------------------------------------
-            # If price enters OB:
-            # Mark it as used and remove it.
+            # OB TOUCHED
             # ------------------------------------------------
 
-            if zone_low <= price <= zone_high:
+            if (
+                zone_low
+                <=
+                price
+                <=
+                zone_high
+            ):
 
                 log(
-                    f"{symbol}: {ob['type']} OB touched."
+                    f"{symbol}: "
+                    f"{ob['type']} OB touched."
                 )
 
                 continue
 
             # ------------------------------------------------
-            # Invalidate bullish OB if price breaks below it.
+            # INVALIDATION
             # ------------------------------------------------
 
             if (
                 ob["type"] == "BULLISH"
-                and price < zone_low
+                and
+                price < zone_low
             ):
-                log(
-                    f"{symbol}: bullish OB invalidated."
-                )
-                continue
 
-            # ------------------------------------------------
-            # Invalidate bearish OB if price breaks above it.
-            # ------------------------------------------------
+                log(
+                    f"{symbol}: "
+                    f"bullish OB invalidated."
+                )
+
+                continue
 
             if (
                 ob["type"] == "BEARISH"
-                and price > zone_high
+                and
+                price > zone_high
             ):
+
                 log(
-                    f"{symbol}: bearish OB invalidated."
+                    f"{symbol}: "
+                    f"bearish OB invalidated."
                 )
+
                 continue
 
             # ------------------------------------------------
-            # 1% APPROACH ALERT
+            # 1% APPROACH
             # ------------------------------------------------
 
-            if approaching_ob(ob, price):
+            if is_approaching(
+                ob,
+                price
+            ):
+
                 send_ob_alert(
                     ob,
-                    price,
+                    price
                 )
 
             remaining.append(ob)
@@ -546,10 +704,13 @@ def process_price(symbol, price):
 
 
 # ============================================================
-# CANDLE PROCESSING
+# COMPLETED CANDLE PROCESSING
 # ============================================================
 
-def process_completed_candle(symbol, candle):
+def process_completed_candle(
+    symbol,
+    candle
+):
 
     with data_lock:
 
@@ -558,8 +719,14 @@ def process_completed_candle(symbol, candle):
             []
         )
 
-        # Avoid duplicates.
-        if history and history[-1]["ts"] == candle["ts"]:
+        # Prevent duplicates
+        if (
+            history
+            and
+            history[-1]["ts"]
+            ==
+            candle["ts"]
+        ):
             return
 
         history.append(candle)
@@ -572,62 +739,60 @@ def process_completed_candle(symbol, candle):
 
         candle_history[symbol] = history
 
-        # Recalculate fresh OBs.
-        detected = detect_order_blocks(
+        # Detect ONLY an OB created by this
+        # newly completed candle.
+        ob = detect_latest_order_block(
             symbol,
-            history,
+            history
         )
 
-        existing = {
-            ob_key(ob)
-            for ob in active_obs.get(symbol, [])
-        }
+        if ob is None:
+            return
 
-        current_obs = active_obs.setdefault(
+        key = ob_key(ob)
+
+        # Already known
+        for existing in active_obs.get(
             symbol,
             []
+        ):
+
+            if ob_key(existing) == key:
+                return
+
+        # Fresh OB
+        active_obs.setdefault(
+            symbol,
+            []
+        ).append(ob)
+
+        # Limit memory
+        active_obs[symbol] = (
+            active_obs[symbol]
+            [-MAX_ACTIVE_OBS_PER_SYMBOL:]
         )
 
-        current_ts = candle["ts"]
+        zone_low, zone_high = (
+            get_ob_zone(ob)
+        )
 
-        for ob in detected:
-
-            age_candles = (
-                current_ts - ob["ts"]
-            ) / (15 * 60 * 1000)
-
-            if age_candles < 0:
-                continue
-
-            if age_candles > MAX_OB_AGE_CANDLES:
-                continue
-
-            key = ob_key(ob)
-
-            if key in existing:
-                continue
-
-            # Make sure the OB is still fresh.
-            # We don't know exact tick history here, so
-            # only add newly formed OBs whose formation
-            # candle is recent.
-            if ob["ts"] == current_ts - (15 * 60 * 1000):
-
-                current_obs.append(ob)
-
-                log(
-                    f"NEW {ob['type']} OB: "
-                    f"{symbol} "
-                    f"{format_price(ob['low'])} - "
-                    f"{format_price(ob['high'])}"
-                )
+        log(
+            f"NEW {ob['type']} OB | "
+            f"{symbol} | "
+            f"Zone "
+            f"{format_price(zone_low)}"
+            f" → "
+            f"{format_price(zone_high)}"
+        )
 
 
 # ============================================================
-# WEBSOCKET
+# WEBSOCKET SUBSCRIPTION
 # ============================================================
 
-def subscribe_message(symbols):
+def make_subscription(
+    symbols
+):
 
     args = []
 
@@ -635,131 +800,201 @@ def subscribe_message(symbols):
 
         args.append({
             "channel": "candle15m",
-            "instId": symbol,
+            "instId": symbol
         })
 
         args.append({
             "channel": "tickers",
-            "instId": symbol,
+            "instId": symbol
         })
 
     return json.dumps({
         "op": "subscribe",
-        "args": args,
+        "args": args
     })
 
 
-def on_message(ws, message):
+# ============================================================
+# WEBSOCKET CALLBACKS
+# ============================================================
+
+def on_open(
+    ws,
+    symbols
+):
+
+    log(
+        f"WebSocket connected. "
+        f"Subscribing to "
+        f"{len(symbols)} symbols..."
+    )
+
+    subscription = make_subscription(
+        symbols
+    )
+
+    ws.send(subscription)
+
+    log(
+        f"Subscription sent for "
+        f"{len(symbols)} symbols."
+    )
+
+
+def on_message(
+    ws,
+    message
+):
 
     try:
-        data = json.loads(message)
+        payload = json.loads(
+            message
+        )
     except Exception:
         return
 
-    if data.get("event") in (
-        "subscribe",
-        "unsubscribe",
-        "pong",
-    ):
+    # Subscription confirmation
+    if payload.get("event") == "subscribe":
+
+        arg = payload.get(
+            "arg",
+            {}
+        )
+
+        log(
+            "Subscribed: "
+            f"{arg.get('channel')} "
+            f"{arg.get('instId')}"
+        )
+
         return
 
-    arg = data.get("arg", {})
+    if payload.get("event") == "error":
 
-    channel = arg.get("channel")
-    symbol = arg.get("instId")
+        log(
+            f"BloFin WS ERROR: "
+            f"{payload}"
+        )
 
-    rows = data.get("data", [])
+        return
+
+    arg = payload.get(
+        "arg",
+        {}
+    )
+
+    channel = arg.get(
+        "channel"
+    )
+
+    symbol = arg.get(
+        "instId"
+    )
+
+    rows = payload.get(
+        "data",
+        []
+    )
 
     if not symbol or not rows:
         return
 
-    # --------------------------------------------------------
-    # CANDLE
-    # --------------------------------------------------------
+    # ========================================================
+    # 15M CANDLE
+    # ========================================================
 
     if channel == "candle15m":
 
         for row in rows:
 
             try:
-                ts = int(row[0])
-                open_price = float(row[1])
-                high = float(row[2])
-                low = float(row[3])
-                close = float(row[4])
-                volume = float(row[5])
 
-                confirm = str(
-                    row[8]
-                ) if len(row) > 8 else "0"
+                ts = int(row[0])
+
+                candle = {
+                    "ts": ts,
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5])
+                }
+
+                # Futures candle:
+                # index 8 = confirm
+                confirm = (
+                    str(row[8])
+                    if len(row) > 8
+                    else "0"
+                )
 
             except Exception:
                 continue
 
-            # Only completed candles.
+            # Only completed candles
             if confirm != "1":
                 continue
 
-            candle = {
-                "ts": ts,
-                "open": open_price,
-                "high": high,
-                "low": low,
-                "close": close,
-                "volume": volume,
-            }
-
             process_completed_candle(
                 symbol,
-                candle,
+                candle
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # TICKER
-    # --------------------------------------------------------
+    # ========================================================
 
     elif channel == "tickers":
 
-        item = rows[0]
-
         try:
 
+            item = rows[0]
+
             price = float(
-                item.get("last")
-                or item.get("lastPrice")
-                or 0
+                item.get("last", 0)
             )
 
         except Exception:
             return
 
         if price > 0:
+
             process_price(
                 symbol,
-                price,
+                price
             )
 
 
-def on_error(ws, error):
-    log(f"WebSocket error: {error}")
+def on_error(
+    ws,
+    error
+):
 
-
-def on_close(ws, close_status_code, close_msg):
     log(
-        f"WebSocket closed: "
-        f"{close_status_code} {close_msg}"
+        f"WebSocket error: {error}"
     )
 
 
-def on_open(ws):
-    log("WebSocket connected.")
+def on_close(
+    ws,
+    close_status,
+    close_message
+):
+
+    log(
+        f"WebSocket closed: "
+        f"{close_status} "
+        f"{close_message}"
+    )
 
 
 # ============================================================
 # WEBSOCKET WORKER
 # ============================================================
 
-def websocket_worker(symbols):
+def websocket_worker(
+    symbols
+):
 
     while True:
 
@@ -772,25 +1007,36 @@ def websocket_worker(symbols):
 
             ws = websocket.WebSocketApp(
                 BLOFIN_WS,
-                on_open=on_open,
+
+                on_open=lambda ws:
+                    on_open(
+                        ws,
+                        symbols
+                    ),
+
                 on_message=on_message,
+
                 on_error=on_error,
-                on_close=on_close,
+
+                on_close=on_close
             )
 
             ws.run_forever(
                 ping_interval=15,
-                ping_timeout=10,
-                reconnect=5,
+                ping_timeout=10
             )
 
         except Exception as e:
 
             log(
-                f"WebSocket worker exception: {e}"
+                f"WebSocket exception: "
+                f"{e}"
             )
 
-        log("Reconnecting in 5 seconds...")
+        log(
+            "Reconnecting in 5 seconds..."
+        )
+
         time.sleep(5)
 
 
@@ -800,30 +1046,59 @@ def websocket_worker(symbols):
 
 def initialize():
 
-    log("========================================")
-    log("15M ORDER BLOCK SCANNER")
-    log("========================================")
-    log("Fixed approach distance: 1%")
-    log("BOS/displacement required")
-    log("Fresh OBs only")
-    log("No VWAP")
-    log("No EMA filter")
-    log("========================================")
+    log(
+        "========================================"
+    )
+
+    log(
+        "15M ORDER BLOCK SCANNER"
+    )
+
+    log(
+        "========================================"
+    )
+
+    log(
+        "Approach distance: 1%"
+    )
+
+    log(
+        "BOS/displacement: REQUIRED"
+    )
+
+    log(
+        "Fresh OBs only"
+    )
+
+    log(
+        "No VWAP"
+    )
+
+    log(
+        "No EMA filter"
+    )
+
+    log(
+        "========================================"
+    )
 
     if not DISCORD_WEBHOOK_URL:
+
         raise RuntimeError(
-            "ORDERBLOCK_DISCORD_WEBHOOK_URL is missing."
+            "ORDERBLOCK_DISCORD_WEBHOOK_URL "
+            "is missing."
         )
 
     symbols = get_symbols()
 
     if not symbols:
+
         raise RuntimeError(
             "No BloFin USDT perpetuals found."
         )
 
     log(
-        f"Loading {HISTORY_CANDLES} candles "
+        f"Loading historical 15m candles "
         f"for {len(symbols)} symbols..."
     )
 
@@ -833,33 +1108,37 @@ def initialize():
 
         try:
 
-            candles = get_history(symbol)
+            candles = get_history(
+                symbol
+            )
 
             if candles:
 
-                candle_history[symbol] = candles
-
-                # Do NOT alert on historical OBs.
-                # We only want fresh OBs formed after
-                # the scanner starts.
+                candle_history[symbol] = (
+                    candles
+                )
 
                 active_obs[symbol] = []
 
                 loaded += 1
 
             if loaded % 25 == 0:
+
                 log(
                     f"History loaded: "
-                    f"{loaded}/{len(symbols)}"
+                    f"{loaded}/"
+                    f"{len(symbols)}"
                 )
 
-            # Keep comfortably below BloFin REST limits.
+            # Stay comfortably under
+            # REST request limits.
             time.sleep(0.25)
 
         except Exception as e:
 
             log(
-                f"History failed for {symbol}: {e}"
+                f"History failed for "
+                f"{symbol}: {e}"
             )
 
     log(
@@ -878,57 +1157,77 @@ def main():
 
     symbols = initialize()
 
-    # BloFin limits subscription message size,
-    # so split symbols across several connections.
+    # BloFin limits the total subscription
+    # message length to 4096 bytes.
+    #
+    # 25 symbols × 2 channels is safely
+    # below that limit.
 
-    groups = []
+    GROUP_SIZE = 25
 
-    current = []
-
-    # Keep each group comfortably below message limits.
-    for symbol in symbols:
-
-        current.append(symbol)
-
-        if len(current) >= 40:
-
-            groups.append(current)
-            current = []
-
-    if current:
-        groups.append(current)
+    groups = [
+        symbols[i:i + GROUP_SIZE]
+        for i in range(
+            0,
+            len(symbols),
+            GROUP_SIZE
+        )
+    ]
 
     log(
-        f"Created {len(groups)} WebSocket groups."
+        f"Created {len(groups)} "
+        f"WebSocket groups."
     )
 
     threads = []
 
-    for index, group in enumerate(groups):
+    for index, group in enumerate(
+        groups
+    ):
 
         thread = threading.Thread(
             target=websocket_worker,
             args=(group,),
-            daemon=True,
+            daemon=True
         )
 
         thread.start()
 
         threads.append(thread)
 
-        # Avoid opening too many connections at once.
+        # BloFin connection creation
+        # should be staggered.
         time.sleep(1.2)
 
         log(
             f"Started WS group "
-            f"{index + 1}/{len(groups)}"
+            f"{index + 1}/"
+            f"{len(groups)}"
         )
 
-    log("ORDER BLOCK SCANNER IS LIVE.")
+    log(
+        "========================================"
+    )
+
+    log(
+        "ORDER BLOCK SCANNER IS LIVE."
+    )
+
+    log(
+        "Waiting for fresh 15M OBs..."
+    )
+
+    log(
+        "========================================"
+    )
 
     while True:
         time.sleep(60)
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
