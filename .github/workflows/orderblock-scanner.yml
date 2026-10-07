@@ -1,0 +1,33 @@
+name: 15M Order Block Scanner
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: orderblock-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install requests websocket-client
+
+      - name: Start 15M Order Block Scanner
+        env:
+          ORDERBLOCK_DISCORD_WEBHOOK_URL: ${{ secrets.ORDERBLOCK_DISCORD_WEBHOOK_URL }}
+        run: |
+          python orderblock_scanner.py
