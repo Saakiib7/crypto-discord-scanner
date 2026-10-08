@@ -40,10 +40,7 @@ def now_utc():
 
 
 def fmt_ts(ts_ms):
-    return datetime.fromtimestamp(
-        int(ts_ms) / 1000,
-        tz=timezone.utc
-    ).strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def safe_float(value):
@@ -56,7 +53,6 @@ def safe_float(value):
 def candle_from_row(row):
     if not isinstance(row, list) or len(row) < 6:
         return None
-
     try:
         return {
             "ts": int(row[0]),
@@ -72,65 +68,48 @@ def candle_from_row(row):
 
 def parse_candles(raw):
     candles = []
-
     for row in raw:
         candle = candle_from_row(row)
-
         if candle is not None:
             candles.append(candle)
-
     candles.sort(key=lambda x: x["ts"])
-
     return candles
 
 
 def candle_direction(candle):
     if candle["close"] > candle["open"]:
         return "BULLISH"
-
     if candle["close"] < candle["open"]:
         return "BEARISH"
-
     return "DOJI"
 
 
 def calculate_atr(candles, period=ATR_PERIOD):
     atr_values = [None] * len(candles)
-
     if len(candles) <= period:
         return atr_values
 
     true_ranges = []
-
     for i, candle in enumerate(candles):
         if i == 0:
             tr = candle["high"] - candle["low"]
-
         else:
             previous_close = candles[i - 1]["close"]
-
             tr = max(
                 candle["high"] - candle["low"],
                 abs(candle["high"] - previous_close),
                 abs(candle["low"] - previous_close),
             )
-
         true_ranges.append(tr)
 
-    initial_atr = sum(
-        true_ranges[1:period + 1]
-    ) / period
-
+    initial_atr = sum(true_ranges[1:period + 1]) / period
     atr_values[period] = initial_atr
-
     previous_atr = initial_atr
 
     for i in range(period + 1, len(candles)):
         previous_atr = (
-            previous_atr * (period - 1)
-            + true_ranges[i]
+            previous_atr * (period - 1) + true_ranges[i]
         ) / period
-
         atr_values[i] = previous_atr
 
     return atr_values
@@ -139,23 +118,16 @@ def calculate_atr(candles, period=ATR_PERIOD):
 def is_swing_high(candles, index):
     if index < SWING_LEFT_RIGHT:
         return False
-
     if index + SWING_LEFT_RIGHT >= len(candles):
         return False
 
     pivot_high = candles[index]["high"]
 
-    for i in range(
-        index - SWING_LEFT_RIGHT,
-        index
-    ):
+    for i in range(index - SWING_LEFT_RIGHT, index):
         if pivot_high <= candles[i]["high"]:
             return False
 
-    for i in range(
-        index + 1,
-        index + SWING_LEFT_RIGHT + 1
-    ):
+    for i in range(index + 1, index + SWING_LEFT_RIGHT + 1):
         if pivot_high < candles[i]["high"]:
             return False
 
@@ -165,73 +137,45 @@ def is_swing_high(candles, index):
 def is_swing_low(candles, index):
     if index < SWING_LEFT_RIGHT:
         return False
-
     if index + SWING_LEFT_RIGHT >= len(candles):
         return False
 
     pivot_low = candles[index]["low"]
 
-    for i in range(
-        index - SWING_LEFT_RIGHT,
-        index
-    ):
+    for i in range(index - SWING_LEFT_RIGHT, index):
         if pivot_low >= candles[i]["low"]:
             return False
 
-    for i in range(
-        index + 1,
-        index + SWING_LEFT_RIGHT + 1
-    ):
+    for i in range(index + 1, index + SWING_LEFT_RIGHT + 1):
         if pivot_low > candles[i]["low"]:
             return False
 
     return True
 
 
-def find_last_swing_before_bos(
-    candles,
-    bos_index,
-    direction
-):
-    latest_possible_swing = (
-        bos_index - SWING_LEFT_RIGHT
-    )
+def find_last_swing_before_bos(candles, bos_index, direction):
+    latest_possible_swing = bos_index - SWING_LEFT_RIGHT
 
     for swing_index in range(
         latest_possible_swing,
         SWING_LEFT_RIGHT - 1,
-        -1
+        -1,
     ):
         if direction == "BULLISH":
-            if is_swing_high(
-                candles,
-                swing_index
-            ):
+            if is_swing_high(candles, swing_index):
                 return swing_index
-
         else:
-            if is_swing_low(
-                candles,
-                swing_index
-            ):
+            if is_swing_low(candles, swing_index):
                 return swing_index
 
     return None
 
 
-def find_impulse_start(
-    candles,
-    bos_index,
-    direction
-):
+def find_impulse_start(candles, bos_index, direction):
     start = bos_index
 
     while start - 1 >= 0:
-        if (
-            candle_direction(
-                candles[start - 1]
-            ) == direction
-        ):
+        if candle_direction(candles[start - 1]) == direction:
             start -= 1
         else:
             break
@@ -239,73 +183,34 @@ def find_impulse_start(
     return start
 
 
-def find_order_block(
-    candles,
-    impulse_start,
-    direction
-):
-    opposite = (
-        "BEARISH"
-        if direction == "BULLISH"
-        else "BULLISH"
-    )
+def find_order_block(candles, impulse_start, direction):
+    opposite = "BEARISH" if direction == "BULLISH" else "BULLISH"
 
-    for index in range(
-        impulse_start - 1,
-        -1,
-        -1
-    ):
-        if (
-            candle_direction(
-                candles[index]
-            ) == opposite
-        ):
+    for index in range(impulse_start - 1, -1, -1):
+        if candle_direction(candles[index]) == opposite:
             return index
 
     return None
 
 
-def detect_order_blocks(
-    symbol,
-    candles
-):
-    minimum_length = (
-        ATR_PERIOD
-        + SWING_LEFT_RIGHT * 2
-        + 5
-    )
-
+def detect_order_blocks(symbol, candles):
+    minimum_length = ATR_PERIOD + SWING_LEFT_RIGHT * 2 + 5
     if len(candles) < minimum_length:
         return []
 
     atr_values = calculate_atr(candles)
-
     candidates = []
 
-    for bos_index in range(
-        ATR_PERIOD + 5,
-        len(candles)
-    ):
+    for bos_index in range(ATR_PERIOD + 5, len(candles)):
         bos_candle = candles[bos_index]
+        direction = candle_direction(bos_candle)
 
-        direction = candle_direction(
-            bos_candle
-        )
-
-        if direction not in (
-            "BULLISH",
-            "BEARISH"
-        ):
+        if direction not in ("BULLISH", "BEARISH"):
             continue
 
-        swing_index = (
-            find_last_swing_before_bos(
-                candles,
-                bos_index,
-                direction
-            )
+        swing_index = find_last_swing_before_bos(
+            candles, bos_index, direction
         )
-
         if swing_index is None:
             continue
 
@@ -318,47 +223,32 @@ def detect_order_blocks(
         if direction == "BULLISH":
             if bos_candle["close"] <= swing_price:
                 continue
-
         else:
             if bos_candle["close"] >= swing_price:
                 continue
 
         impulse_start = find_impulse_start(
-            candles,
-            bos_index,
-            direction
+            candles, bos_index, direction
         )
-
         if impulse_start >= bos_index:
             continue
 
         ob_index = find_order_block(
-            candles,
-            impulse_start,
-            direction
+            candles, impulse_start, direction
         )
-
         if ob_index is None:
             continue
 
         ob_candle = candles[ob_index]
-
         atr = atr_values[bos_index]
 
         if atr is None or atr <= 0:
             continue
 
         if direction == "BULLISH":
-            expansion = (
-                bos_candle["close"]
-                - ob_candle["high"]
-            )
-
+            expansion = bos_candle["close"] - ob_candle["high"]
         else:
-            expansion = (
-                ob_candle["low"]
-                - bos_candle["close"]
-            )
+            expansion = ob_candle["low"] - bos_candle["close"]
 
         if expansion <= 0:
             continue
@@ -369,9 +259,7 @@ def detect_order_blocks(
             continue
 
         ob_id = (
-            f"{symbol}:"
-            f"{ob_candle['ts']}:"
-            f"{direction}"
+            f"{symbol}:{ob_candle['ts']}:{direction}"
         )
 
         candidates.append({
@@ -389,27 +277,18 @@ def detect_order_blocks(
             "atr": atr,
             "expansion": expansion,
             "expansion_atr": expansion_atr,
-            "impulse_ts": candles[
-                impulse_start
-            ]["ts"],
+            "impulse_ts": candles[impulse_start]["ts"],
         })
 
     unique = {}
-
     for ob in candidates:
         unique[ob["id"]] = ob
 
     return list(unique.values())
 
 
-def historical_ob_status(
-    ob,
-    candles
-):
-    for index in range(
-        ob["ob_index"] + 1,
-        len(candles)
-    ):
+def historical_ob_status(ob, candles):
+    for index in range(ob["ob_index"] + 1, len(candles)):
         candle = candles[index]
 
         if (
@@ -433,7 +312,9 @@ def historical_ob_status(
             return "mitigated"
 
     return "fresh"
-    def get_symbols():
+
+
+def get_symbols():
     url = f"{BLOFIN_REST}/api/v1/market/instruments"
 
     try:
@@ -442,7 +323,6 @@ def historical_ob_status(
             params={"instType": "SWAP"},
             timeout=20,
         )
-
         response.raise_for_status()
         payload = response.json()
 
@@ -466,10 +346,7 @@ def historical_ob_status(
 
         print()
         print("=" * 70)
-        print(
-            f"BLOFIN LIVE USDT PERPETUALS: "
-            f"{len(result)}"
-        )
+        print(f"BLOFIN LIVE USDT PERPETUALS: {len(result)}")
         print("=" * 70)
 
         return result
@@ -502,15 +379,10 @@ def get_history(symbol):
             if response.status_code == 200:
                 payload = response.json()
 
-                if payload.get("code") not in (
-                    None,
-                    "0",
-                    0
-                ):
+                if payload.get("code") not in (None, "0", 0):
                     print(
                         f"[HISTORY ERROR] {symbol}: "
-                        f"API code "
-                        f"{payload.get('code')} "
+                        f"API code {payload.get('code')} "
                         f"{payload.get('msg', '')}"
                     )
                     return []
@@ -526,32 +398,23 @@ def get_history(symbol):
                 ]
 
             if response.status_code == 429:
-                retry_after = (
-                    response.headers.get(
-                        "Retry-After"
-                    )
-                )
+                retry_after = response.headers.get("Retry-After")
 
                 if retry_after:
                     try:
-                        wait_time = float(
-                            retry_after
-                        )
+                        wait_time = float(retry_after)
                     except ValueError:
                         wait_time = 5.0
                 else:
                     wait_time = min(
                         30.0,
-                        5.0 * (2 ** attempt)
+                        5.0 * (2 ** attempt),
                     )
 
                 print(
-                    f"[RATE LIMIT] {symbol}: "
-                    f"HTTP 429 -> waiting "
-                    f"{wait_time:.1f}s "
-                    f"(attempt "
-                    f"{attempt + 1}/"
-                    f"{max_attempts})"
+                    f"[RATE LIMIT] {symbol}: HTTP 429 -> "
+                    f"waiting {wait_time:.1f}s "
+                    f"(attempt {attempt + 1}/{max_attempts})"
                 )
 
                 time.sleep(wait_time)
@@ -559,20 +422,18 @@ def get_history(symbol):
 
             print(
                 f"[HISTORY ERROR] {symbol}: "
-                f"HTTP "
-                f"{response.status_code}"
+                f"HTTP {response.status_code}"
             )
 
         except requests.RequestException as e:
             wait_time = min(
                 30.0,
-                5.0 * (2 ** attempt)
+                5.0 * (2 ** attempt),
             )
 
             print(
-                f"[HISTORY ERROR] {symbol}: "
-                f"{e} -> retrying in "
-                f"{wait_time:.1f}s"
+                f"[HISTORY ERROR] {symbol}: {e} -> "
+                f"retrying in {wait_time:.1f}s"
             )
 
             time.sleep(wait_time)
@@ -581,7 +442,6 @@ def get_history(symbol):
         f"[HISTORY FAILED] {symbol}: "
         f"all {max_attempts} attempts failed"
     )
-
     return []
 
 
@@ -589,17 +449,9 @@ def load_historical_obs(symbols):
     print()
     print("=" * 70)
     print("STARTING HISTORICAL 15M OB SCAN")
-    print(
-        f"Symbols: {len(symbols)}"
-    )
-    print(
-        f"Candles per symbol: "
-        f"{HISTORY_CANDLES}"
-    )
-    print(
-        "Mode: sequential + "
-        "0.5s REST pacing"
-    )
+    print(f"Symbols: {len(symbols)}")
+    print(f"Candles per symbol: {HISTORY_CANDLES}")
+    print("Mode: sequential + 0.5s REST pacing")
     print("=" * 70)
 
     successful = 0
@@ -614,39 +466,22 @@ def load_historical_obs(symbols):
 
             if candles:
                 successful += 1
-
                 HISTORY[symbol] = candles
+                LAST_COMPLETED_TS[symbol] = candles[-1]["ts"]
 
-                LAST_COMPLETED_TS[symbol] = (
-                    candles[-1]["ts"]
-                )
-
-                obs = detect_order_blocks(
-                    symbol,
-                    candles
-                )
-
+                obs = detect_order_blocks(symbol, candles)
                 obs.sort(
                     key=lambda x: x["ob_ts"],
-                    reverse=True
+                    reverse=True,
                 )
 
                 fresh = []
 
                 for ob in obs:
-                    if (
-                        historical_ob_status(
-                            ob,
-                            candles
-                        )
-                        == "fresh"
-                    ):
+                    if historical_ob_status(ob, candles) == "fresh":
                         fresh.append(ob)
 
-                    if (
-                        len(fresh)
-                        >= MAX_ACTIVE_OBS_PER_SYMBOL
-                    ):
+                    if len(fresh) >= MAX_ACTIVE_OBS_PER_SYMBOL:
                         break
 
                 with state_lock:
@@ -655,23 +490,13 @@ def load_historical_obs(symbols):
                 fresh_total += len(fresh)
 
         except Exception as e:
-            print(
-                f"HISTORICAL ERROR "
-                f"{symbol}: {e}"
-            )
+            print(f"HISTORICAL ERROR {symbol}: {e}")
 
-        if (
-            completed % 25 == 0
-            or completed == len(symbols)
-        ):
+        if completed % 25 == 0 or completed == len(symbols):
             print(
-                f"Historical scan: "
-                f"{completed}/"
-                f"{len(symbols)} | "
-                f"successful: "
-                f"{successful} | "
-                f"fresh OBs: "
-                f"{fresh_total}"
+                f"Historical scan: {completed}/{len(symbols)} | "
+                f"successful: {successful} | "
+                f"fresh OBs: {fresh_total}"
             )
 
         if completed < len(symbols):
@@ -680,20 +505,9 @@ def load_historical_obs(symbols):
     print()
     print("=" * 70)
     print("HISTORICAL SCAN COMPLETE")
-    print(
-        f"Symbols processed: "
-        f"{completed}/"
-        f"{len(symbols)}"
-    )
-    print(
-        f"Successful histories: "
-        f"{successful}/"
-        f"{len(symbols)}"
-    )
-    print(
-        f"Fresh historical OBs: "
-        f"{fresh_total}"
-    )
+    print(f"Symbols processed: {completed}/{len(symbols)}")
+    print(f"Successful histories: {successful}/{len(symbols)}")
+    print(f"Fresh historical OBs: {fresh_total}")
     print("=" * 70)
 
 
@@ -705,50 +519,30 @@ def distance_to_ob(price, ob):
         return 0.0
 
     if price > high:
-        return (
-            (price - high)
-            / price
-            * 100
-        )
+        return ((price - high) / price) * 100
 
-    return (
-        (low - price)
-        / price
-        * 100
-    )
+    return ((low - price) / price) * 100
 
 
-def send_discord(
-    ob,
-    price,
-    reason="APPROACH"
-):
+def send_discord(ob, price, reason="APPROACH"):
     if not DISCORD_WEBHOOK_URL:
-        print(
-            "DISCORD WEBHOOK NOT SET"
-        )
+        print("DISCORD WEBHOOK NOT SET")
         return False
 
-    distance = distance_to_ob(
-        price,
-        ob
-    )
+    distance = distance_to_ob(price, ob)
 
     title = (
         "🟢 15M BULLISH ORDER BLOCK"
         if ob["direction"] == "BULLISH"
-        else
-        "🔴 15M BEARISH ORDER BLOCK"
+        else "🔴 15M BEARISH ORDER BLOCK"
     )
 
     embed = {
         "title": title,
         "description": (
             f"**{ob['symbol']}**\n"
-            f"Price is within "
-            f"**{APPROACH_PERCENT:.2f}%** "
-            f"of a fresh 15M "
-            f"Order Block."
+            f"Price is within **{APPROACH_PERCENT:.2f}%** "
+            f"of a fresh 15M Order Block."
         ),
         "fields": [
             {
@@ -769,46 +563,36 @@ def send_discord(
             {
                 "name": "OB Zone",
                 "value": (
-                    f"{ob['ob_low']:.12g}"
-                    f" → "
+                    f"{ob['ob_low']:.12g} → "
                     f"{ob['ob_high']:.12g}"
                 ),
                 "inline": False,
             },
             {
                 "name": "OB Candle",
-                "value": fmt_ts(
-                    ob["ob_ts"]
-                ),
+                "value": fmt_ts(ob["ob_ts"]),
                 "inline": True,
             },
             {
                 "name": "BOS Candle",
-                "value": fmt_ts(
-                    ob["bos_ts"]
-                ),
+                "value": fmt_ts(ob["bos_ts"]),
                 "inline": True,
             },
             {
                 "name": "Impulse Start",
-                "value": fmt_ts(
-                    ob["impulse_ts"]
-                ),
+                "value": fmt_ts(ob["impulse_ts"]),
                 "inline": True,
             },
             {
                 "name": "ATR(14)",
-                "value": (
-                    f"{ob['atr']:.8g}"
-                ),
+                "value": f"{ob['atr']:.8g}",
                 "inline": True,
             },
             {
                 "name": "Expansion",
                 "value": (
                     f"{ob['expansion']:.8g} "
-                    f"({ob['expansion_atr']:.2f} "
-                    f"ATR)"
+                    f"({ob['expansion_atr']:.2f} ATR)"
                 ),
                 "inline": True,
             },
@@ -816,16 +600,13 @@ def send_discord(
                 "name": "Rules",
                 "value": (
                     "5-bar BOS • Body close • "
-                    "≥1.5 ATR expansion • "
-                    "Full candle OB"
+                    "≥1.5 ATR expansion • Full candle OB"
                 ),
                 "inline": False,
             },
         ],
         "footer": {
-            "text":
-                "BloFin 15M "
-                "Order Block Scanner"
+            "text": "BloFin 15M Order Block Scanner"
         },
     }
 
@@ -841,54 +622,38 @@ def send_discord(
             timeout=10,
         )
 
-        if response.status_code in (
-            200,
-            204
-        ):
+        if response.status_code in (200, 204):
             print(
                 f"DISCORD ALERT SENT | "
                 f"{ob['symbol']} | "
                 f"{ob['direction']} | "
                 f"{distance:.3f}%"
             )
-
             return True
 
         print(
-            f"DISCORD ERROR: HTTP "
-            f"{response.status_code} "
+            f"DISCORD ERROR: HTTP {response.status_code} "
             f"{response.text[:300]}"
         )
 
     except Exception as e:
-        print(
-            f"DISCORD EXCEPTION: {e}"
-        )
+        print(f"DISCORD EXCEPTION: {e}")
 
     return False
 
 
-def process_price(
-    symbol,
-    price
-):
+def process_price(symbol, price):
     if price is None:
         return
 
     with state_lock:
         CURRENT_PRICES[symbol] = price
-        obs = list(
-            ACTIVE_OBS.get(
-                symbol,
-                []
-            )
-        )
+        obs = list(ACTIVE_OBS.get(symbol, []))
 
     for ob in obs:
-        distance = distance_to_ob(
-            price,
-            ob
-        )
+        # Ticker price only triggers the approach alert.
+        # Mitigation/invalidation uses completed 15M candles.
+        distance = distance_to_ob(price, ob)
 
         if distance > APPROACH_PERCENT:
             continue
@@ -898,71 +663,44 @@ def process_price(
         with state_lock:
             if ob_id in ALERTED_OB_IDS:
                 continue
-
             ALERTED_OB_IDS.add(ob_id)
 
         success = send_discord(
             ob,
             price,
-            "PRICE WITHIN 0.50%"
+            "PRICE WITHIN 0.50%",
         )
 
         if not success:
             with state_lock:
-                ALERTED_OB_IDS.discard(
-                    ob_id
-                )
+                ALERTED_OB_IDS.discard(ob_id)
 
 
-def process_completed_candle(
-    symbol,
-    candle
-):
+def process_completed_candle(symbol, candle):
     if candle.get("confirm") != "1":
         return
 
     ts = candle["ts"]
 
     with state_lock:
-        previous_ts = (
-            LAST_COMPLETED_TS.get(
-                symbol
-            )
-        )
+        previous_ts = LAST_COMPLETED_TS.get(symbol)
 
-        if (
-            previous_ts is not None
-            and ts <= previous_ts
-        ):
+        if previous_ts is not None and ts <= previous_ts:
             return
 
         LAST_COMPLETED_TS[symbol] = ts
 
-        candles = HISTORY.setdefault(
-            symbol,
-            []
-        )
+        candles = HISTORY.setdefault(symbol, [])
 
-        if (
-            candles
-            and candles[-1]["ts"] == ts
-        ):
+        if candles and candles[-1]["ts"] == ts:
             candles[-1] = candle
-
         else:
             candles.append(candle)
 
         if len(candles) > HISTORY_CANDLES:
-            del candles[
-                :-HISTORY_CANDLES
-            ]
+            del candles[:-HISTORY_CANDLES]
 
-        existing_obs = list(
-            ACTIVE_OBS.get(
-                symbol,
-                []
-            )
-        )
+        existing_obs = list(ACTIVE_OBS.get(symbol, []))
 
     remaining = []
 
@@ -971,42 +709,34 @@ def process_completed_candle(
         mitigated = False
 
         if (
-            ob["direction"]
-            == "BULLISH"
-            and candle["close"]
-            < ob["ob_low"]
+            ob["direction"] == "BULLISH"
+            and candle["close"] < ob["ob_low"]
         ):
             invalidated = True
 
         if (
-            ob["direction"]
-            == "BEARISH"
-            and candle["close"]
-            > ob["ob_high"]
+            ob["direction"] == "BEARISH"
+            and candle["close"] > ob["ob_high"]
         ):
             invalidated = True
 
         if (
             candle["ts"] > ob["ob_ts"]
-            and candle["high"]
-            >= ob["ob_low"]
-            and candle["low"]
-            <= ob["ob_high"]
+            and candle["high"] >= ob["ob_low"]
+            and candle["low"] <= ob["ob_high"]
         ):
             mitigated = True
 
         if invalidated:
             print(
-                f"OB INVALIDATED | "
-                f"{symbol} | "
+                f"OB INVALIDATED | {symbol} | "
                 f"{ob['direction']}"
             )
             continue
 
         if mitigated:
             print(
-                f"OB MITIGATED | "
-                f"{symbol} | "
+                f"OB MITIGATED | {symbol} | "
                 f"{ob['direction']}"
             )
             continue
@@ -1015,27 +745,20 @@ def process_completed_candle(
 
     with state_lock:
         candles_snapshot = list(
-            HISTORY.get(
-                symbol,
-                []
-            )
+            HISTORY.get(symbol, [])
         )
 
     candidates = detect_order_blocks(
         symbol,
-        candles_snapshot
+        candles_snapshot,
     )
 
-    existing_ids = {
-        ob["id"]
-        for ob in remaining
-    }
-
+    existing_ids = {ob["id"] for ob in remaining}
     new_obs = []
 
     candidates.sort(
         key=lambda x: x["ob_ts"],
-        reverse=True
+        reverse=True,
     )
 
     for ob in candidates:
@@ -1045,13 +768,10 @@ def process_completed_candle(
         if ob["ob_ts"] >= candle["ts"]:
             continue
 
-        if (
-            historical_ob_status(
-                ob,
-                candles_snapshot
-            )
-            != "fresh"
-        ):
+        if historical_ob_status(
+            ob,
+            candles_snapshot,
+        ) != "fresh":
             continue
 
         new_obs.append(ob)
@@ -1064,25 +784,22 @@ def process_completed_candle(
         )
 
     combined = remaining + new_obs
-
     combined.sort(
         key=lambda x: x["ob_ts"],
-        reverse=True
+        reverse=True,
     )
 
-    combined = combined[
-        :MAX_ACTIVE_OBS_PER_SYMBOL
-    ]
+    combined = combined[:MAX_ACTIVE_OBS_PER_SYMBOL]
 
     with state_lock:
         ACTIVE_OBS[symbol] = combined
-        def handle_ws_message(message, subscribed_symbols):
+
+
+def handle_ws_message(message, subscribed_symbols):
     try:
         if message == "pong":
             return
-
         payload = json.loads(message)
-
     except Exception:
         return
 
@@ -1103,7 +820,6 @@ def process_completed_candle(
         return
 
     arg = payload.get("arg", {})
-
     channel = arg.get("channel")
     symbol = arg.get("instId")
 
@@ -1122,45 +838,33 @@ def process_completed_candle(
             if isinstance(ticker, dict):
                 process_price(
                     symbol,
-                    safe_float(
-                        ticker.get("last")
-                    )
+                    safe_float(ticker.get("last")),
                 )
 
         except Exception as e:
             print(
-                f"TICKER ERROR "
-                f"{symbol}: {e}"
+                f"TICKER ERROR {symbol}: {e}"
             )
 
         return
 
     if channel == "candle15m":
         try:
-            candle = candle_from_row(
-                data[0]
-            )
+            candle = candle_from_row(data[0])
 
-            if (
-                candle is not None
-                and candle["confirm"] == "1"
-            ):
+            if candle is not None and candle["confirm"] == "1":
                 process_completed_candle(
                     symbol,
-                    candle
+                    candle,
                 )
 
         except Exception as e:
             print(
-                f"CANDLE ERROR "
-                f"{symbol}: {e}"
+                f"CANDLE ERROR {symbol}: {e}"
             )
 
 
-def websocket_worker(
-    group_number,
-    group_symbols
-):
+def websocket_worker(group_number, group_symbols):
     channels = []
 
     for symbol in group_symbols:
@@ -1168,23 +872,19 @@ def websocket_worker(
             "channel": "candle15m",
             "instId": symbol,
         })
-
         channels.append({
             "channel": "tickers",
             "instId": symbol,
         })
 
-    subscribed_symbols = set(
-        group_symbols
-    )
+    subscribed_symbols = set(group_symbols)
 
     while True:
         ws = None
 
         try:
             print(
-                f"WS {group_number}: "
-                f"connecting "
+                f"WS {group_number}: connecting "
                 f"({len(group_symbols)} symbols)"
             )
 
@@ -1195,8 +895,7 @@ def websocket_worker(
             )
 
             print(
-                f"WS {group_number}: "
-                f"connected"
+                f"WS {group_number}: connected"
             )
 
             ws.send(
@@ -1210,8 +909,7 @@ def websocket_worker(
             )
 
             print(
-                f"WS {group_number}: "
-                f"subscription sent "
+                f"WS {group_number}: subscription sent "
                 f"({len(channels)} channels)"
             )
 
@@ -1222,38 +920,28 @@ def websocket_worker(
                     message = ws.recv()
 
                     if message:
-                        last_message_time = (
-                            time.time()
-                        )
-
+                        last_message_time = time.time()
                         handle_ws_message(
                             message,
-                            subscribed_symbols
+                            subscribed_symbols,
                         )
 
                 except websocket.WebSocketTimeoutException:
                     if (
-                        time.time()
-                        - last_message_time
+                        time.time() - last_message_time
                         >= HEARTBEAT_SECONDS
                     ):
                         try:
                             ws.send("ping")
-
                             print(
                                 f"WS {group_number}: "
                                 f"heartbeat ping"
                             )
-
-                            last_message_time = (
-                                time.time()
-                            )
-
+                            last_message_time = time.time()
                         except Exception as e:
                             print(
                                 f"WS {group_number}: "
-                                f"heartbeat failed: "
-                                f"{e}"
+                                f"heartbeat failed: {e}"
                             )
                             break
 
@@ -1278,15 +966,10 @@ def websocket_worker(
                     pass
 
         print(
-            f"WS {group_number}: "
-            f"reconnecting in "
-            f"{WS_RECONNECT_DELAY} "
-            f"seconds..."
+            f"WS {group_number}: reconnecting in "
+            f"{WS_RECONNECT_DELAY} seconds..."
         )
-
-        time.sleep(
-            WS_RECONNECT_DELAY
-        )
+        time.sleep(WS_RECONNECT_DELAY)
 
 
 def start_websockets(symbols):
@@ -1300,27 +983,16 @@ def start_websockets(symbols):
         for i in range(
             0,
             len(symbols),
-            WS_GROUP_SIZE
+            WS_GROUP_SIZE,
         )
     ]
 
-    print(
-        f"WebSocket groups: "
-        f"{len(groups)}"
-    )
+    print(f"WebSocket groups: {len(groups)}")
+    print(f"Symbols per group: {WS_GROUP_SIZE}")
 
-    print(
-        f"Symbols per group: "
-        f"{WS_GROUP_SIZE}"
-    )
-
-    for number, group in enumerate(
-        groups,
-        start=1
-    ):
+    for number, group in enumerate(groups, start=1):
         print(
-            f"Starting WS "
-            f"{number}/{len(groups)} "
+            f"Starting WS {number}/{len(groups)} "
             f"({len(group)} symbols)"
         )
 
@@ -1329,48 +1001,21 @@ def start_websockets(symbols):
             args=(number, group),
             daemon=True,
         )
-
         thread.start()
 
-        time.sleep(
-            WS_CONNECT_STAGGER
-        )
+        time.sleep(WS_CONNECT_STAGGER)
 
     print()
     print("=" * 70)
     print("ORDER BLOCK SCANNER IS LIVE")
     print("=" * 70)
-
-    print(
-        "Historical fresh OBs: ACTIVE"
-    )
-
-    print(
-        "New 15M OBs: ACTIVE"
-    )
-
-    print(
-        "Approach alert: 0.50%"
-    )
-
-    print(
-        "Mitigation: completed "
-        "15M candle wick"
-    )
-
-    print(
-        "Invalidation: completed "
-        "15M candle close"
-    )
-
-    print(
-        "EMA/VWAP/volume filters: NONE"
-    )
-
-    print(
-        f"Live since: {now_utc()}"
-    )
-
+    print("Historical fresh OBs: ACTIVE")
+    print("New 15M OBs: ACTIVE")
+    print("Approach alert: 0.50%")
+    print("Mitigation: completed 15M candle wick")
+    print("Invalidation: completed 15M candle close")
+    print("EMA/VWAP/volume filters: NONE")
+    print(f"Live since: {now_utc()}")
     print("=" * 70)
 
 
@@ -1380,15 +1025,11 @@ def status_loop():
 
         with state_lock:
             symbol_count = len(HISTORY)
-
             active_count = sum(
                 len(value)
                 for value in ACTIVE_OBS.values()
             )
-
-            alerted_count = len(
-                ALERTED_OB_IDS
-            )
+            alerted_count = len(ALERTED_OB_IDS)
 
         print(
             f"[STATUS {now_utc()}] "
@@ -1400,3 +1041,52 @@ def status_loop():
 
 def main():
     print("=" * 70)
+    print("15M ORDER BLOCK SCANNER")
+    print("=" * 70)
+    print(
+        "Strategy: 5-bar BOS + "
+        "1.5 ATR expansion"
+    )
+    print(
+        "OB: last opposite candle "
+        "before impulse"
+    )
+    print("Alert threshold: 0.50%")
+    print(
+        "Historical REST: sequential + "
+        "0.5s pacing"
+    )
+    print("=" * 70)
+
+    if not DISCORD_WEBHOOK_URL:
+        print(
+            "ERROR: ORDERBLOCK_DISCORD_WEBHOOK_URL "
+            "is missing."
+        )
+        raise SystemExit(1)
+
+    symbols = get_symbols()
+
+    if not symbols:
+        print(
+            "ERROR: No live USDT "
+            "perpetuals found."
+        )
+        raise SystemExit(1)
+
+    load_historical_obs(symbols)
+
+    status_thread = threading.Thread(
+        target=status_loop,
+        daemon=True,
+    )
+    status_thread.start()
+
+    start_websockets(symbols)
+
+    while True:
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
