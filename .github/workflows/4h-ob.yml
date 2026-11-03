@@ -1,0 +1,32 @@
+name: 4H Order Block Scanner
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: orderblock-4h-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install requests websocket-client
+
+      - name: Start 4H Order Block Scanner
+        env:
+          ORDERBLOCK_4H_DISCORD_WEBHOOK_URL: ${{ secrets.ORDERBLOCK_4H_DISCORD_WEBHOOK_URL }}
+        run: |
+          python orderblock_4h.py
